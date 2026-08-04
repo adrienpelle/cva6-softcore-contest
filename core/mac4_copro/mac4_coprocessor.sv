@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0 WITH SHL-2.0
 //
-// Top-level CV-X-IF coprocessor implementing the MAC4 custom instruction.
-// Replaces core/cvxif_example/cvxif_example_coprocessor.sv wholesale on the
-// build/config path used for sw/app/mnist.
+// Top-level CV-X-IF coprocessor implementing the MAC4 v2 custom
+// instructions. Replaces core/cvxif_example/cvxif_example_coprocessor.sv
+// wholesale on the build/config path used for sw/app/mnist.
 //
 // Reuses core/cvxif_example/instr_decoder.sv as-is: it is a generic,
 // table-driven issue decoder (parameterized on the instruction table, not
@@ -10,6 +10,13 @@
 // changes. MAC4 has no compressed variant, so the compressed interface is
 // hardwired to always reject rather than instantiating
 // core/cvxif_example/compressed_instr_decoder.sv for an empty table.
+//
+// instr_decoder.sv only ever exposes rd (instr[11:7]) as a generic address
+// field, not funct7 -- LOAD_STATIONARY/MAC_TILED/READ_ACC need funct7 as a
+// data field (stationary word index / accumulator slot, see
+// mac4_instr_pkg.sv), so it is tapped directly off issue_req.instr here,
+// at this MAC4-specific integration level, rather than touching the generic
+// decoder.
 
 module mac4_coprocessor
   import mac4_instr_pkg::*;
@@ -71,6 +78,12 @@ module mac4_coprocessor
   assign register                      = cvxif_req_i.register;
   assign register_valid                = cvxif_req_i.register_valid;
 
+  // funct7 field of the offloaded instruction, reused as data by the new
+  // MAC4 v2 instructions (see mac4_instr_pkg.sv). Not produced by
+  // instr_decoder_i, so read directly from the raw issue request.
+  logic [6:0] funct7;
+  assign funct7 = issue_req.instr[31:25];
+
   instr_decoder #(
       .copro_issue_resp_t(mac4_instr_pkg::copro_issue_resp_t),
       .opcode_t(mac4_instr_pkg::opcode_t),
@@ -111,6 +124,7 @@ module mac4_coprocessor
       .rst_ni     (rst_ni),
       .registers_i(registers),
       .opcode_i   (opcode),
+      .funct7_i   (funct7),
       .hartid_i   (issue_hartid),
       .id_i       (issue_id),
       .rd_i       (issue_rd),
