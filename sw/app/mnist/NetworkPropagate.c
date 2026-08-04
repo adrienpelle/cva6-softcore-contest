@@ -1,5 +1,7 @@
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdint.h>
+#include <string.h>
 
 #ifdef __riscv
 #include "encoding.h"
@@ -7,6 +9,7 @@
 
 #include "env.h"
 #include "mem_info.h"
+#include "mac4.h"
 
 #include "conv1.h"
 #include "conv2.h"
@@ -37,7 +40,36 @@ static void macsOnRange(const UDATA_T* __restrict inputs,
                         SUM_T* __restrict weightedSum,
                         int nb_iterations)
 {
-    for (int iter = 0; iter < nb_iterations; ++iter) {
+    int iter = 0;
+
+    // 4-wide MAC4 fast path: only taken when both pointers are 4-byte
+    // aligned, checked per call -- no per-layer special-casing. Always
+    // aligned for conv2/fc1/fc2 (channel strides are multiples of 4).
+    // conv1's stride-2 window over a single-channel buffer makes iOffset
+    // alternate 0/2 mod 4 across output columns, so only every other call
+    // takes this path there; the rest fall through to the scalar loop
+    // below, safely (this check never passes on a genuinely misaligned
+    // pointer, so it never risks the hang a misaligned lw/sw causes on
+    // this core).
+    if ((((uintptr_t)inputs | (uintptr_t)weights) & 0x3u) == 0) {
+        int32_t acc = *weightedSum;
+        const int nb_groups = nb_iterations / 4;
+
+        for (int g = 0; g < nb_groups; ++g) {
+            uint32_t packed_inputs, packed_weights;
+            // memcpy rather than a (uint32_t*) cast: avoids the strict-
+            // aliasing UB of reading a uint8_t/int8_t array through a
+            // differently-typed pointer. Compiles down to a single lw.
+            memcpy(&packed_inputs, &inputs[iter], sizeof(packed_inputs));
+            memcpy(&packed_weights, &weights[iter], sizeof(packed_weights));
+            acc += mac4(packed_inputs, packed_weights);
+            iter += 4;
+        }
+
+        *weightedSum = acc;
+    }
+
+    for (; iter < nb_iterations; ++iter) {
         *weightedSum += inputs[iter] * weights[iter];
     }
 }
