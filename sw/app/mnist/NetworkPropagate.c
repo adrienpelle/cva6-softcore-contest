@@ -1,6 +1,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+#ifdef __riscv
+#include "encoding.h"
+#endif
+
 #include "env.h"
 #include "mem_info.h"
 
@@ -430,9 +434,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     // conv1
     UDATA_T* conv1_output = (UDATA_T*) mem + CONV1_MEM_CONT_OFFSET;
 
-#ifdef BENCHMARK
-    const Tick_T start_conv1 = tick();
-#endif
+    const unsigned long start_conv1 = read_csr(mcycle);
 
     convcellPropagate1(inputs , conv1_output, conv1_biases, conv1_weights, 8,
     CONV1_NB_CHANNELS, CONV1_CHANNELS_HEIGHT, CONV1_CHANNELS_WIDTH, CONV1_NB_OUTPUTS, CONV1_OUTPUTS_HEIGHT, 
@@ -442,11 +444,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
 
     //convcellPropagate1(inputs , conv1_output, conv1_biases, conv1_weights, CONV1_SCALING);
 
-#ifdef BENCHMARK
-    const Tick_T end_conv1 = tick();
-    static RunningMean_T conv1_timing = {0.0, 0};
-    benchmark("conv1", start_conv1, end_conv1, conv1_timing);
-#endif
+    printf("conv1: %lu cycles\n", read_csr(mcycle) - start_conv1);
 
 #ifdef SAVE_OUTPUTS
     FILE* conv1_stream = fopen("conv1_output.txt", "w");
@@ -460,9 +458,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     // conv2
     UDATA_T* conv2_output = (UDATA_T*) mem + CONV2_MEM_CONT_OFFSET;
 
-#ifdef BENCHMARK
-    const Tick_T start_conv2 = tick();
-#endif
+    const unsigned long start_conv2 = read_csr(mcycle);
 
     convcellPropagate1(conv1_output , conv2_output, conv2_biases, conv2_weights, 8,
     CONV2_NB_CHANNELS, CONV2_CHANNELS_HEIGHT, CONV2_CHANNELS_WIDTH, 
@@ -475,11 +471,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
 
     //convcellPropagate2(conv1_output , conv2_output, conv2_biases, conv2_weights, CONV2_SCALING);
 
-#ifdef BENCHMARK
-    const Tick_T end_conv2 = tick();
-    static RunningMean_T conv2_timing = {0.0, 0};
-    benchmark("conv2", start_conv2, end_conv2, conv2_timing);
-#endif
+    printf("conv2: %lu cycles\n", read_csr(mcycle) - start_conv2);
 
 #ifdef SAVE_OUTPUTS
     FILE* conv2_stream = fopen("conv2_output.txt", "w");
@@ -493,9 +485,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     // fc1
     UDATA_T* fc1_output = (UDATA_T*) mem + FC1_MEM_CONT_OFFSET;
 
-#ifdef BENCHMARK
-    const Tick_T start_fc1 = tick();
-#endif
+    const unsigned long start_fc1 = read_csr(mcycle);
 
     fccellPropagateUDATA_T(conv2_output , fc1_output, fc1_biases, fc1_weights, 8,
     FC1_NB_CHANNELS, FC1_CHANNELS_HEIGHT, 
@@ -506,11 +496,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     CONV2_MEM_STRIDE, FC1_MEM_CONT_OFFSET, 
     FC1_MEM_CONT_SIZE, FC1_MEM_WRAP_OFFSET, FC1_MEM_WRAP_SIZE, FC1_MEM_STRIDE);
 
-#ifdef BENCHMARK
-    const Tick_T end_fc1 = tick();
-    static RunningMean_T fc1_timing = {0.0, 0};
-    benchmark("fc1", start_fc1, end_fc1, fc1_timing);
-#endif
+    printf("fc1: %lu cycles\n", read_csr(mcycle) - start_fc1);
 
 #ifdef SAVE_OUTPUTS
     FILE* fc1_stream = fopen("fc1_output.txt", "w");
@@ -524,9 +510,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     // fc2
     DATA_T* fc2_output = (DATA_T*) mem + FC2_MEM_CONT_OFFSET;
 
-#ifdef BENCHMARK
-    const Tick_T start_fc2 = tick();
-#endif
+    const unsigned long start_fc2 = read_csr(mcycle);
 
     fccellPropagateDATA_T(fc1_output , fc2_output, fc2_biases, fc2_weights, 11,
     FC2_NB_CHANNELS, FC2_CHANNELS_HEIGHT, 
@@ -538,11 +522,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     FC2_MEM_CONT_OFFSET, FC2_MEM_CONT_SIZE, 
     FC2_MEM_WRAP_OFFSET, FC2_MEM_WRAP_SIZE, FC2_MEM_STRIDE);
 
-#ifdef BENCHMARK
-    const Tick_T end_fc2 = tick();
-    static RunningMean_T fc2_timing = {0.0, 0};
-    benchmark("fc2", start_fc2, end_fc2, fc2_timing);
-#endif
+    printf("fc2: %lu cycles\n", read_csr(mcycle) - start_fc2);
 
 #ifdef SAVE_OUTPUTS
     FILE* fc2_stream = fopen("fc2_output.txt", "w");
