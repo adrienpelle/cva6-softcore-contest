@@ -11,6 +11,22 @@
 // and accumulators are the only state that persists *between* instructions;
 // everything else (result/hartid/id/rd/valid/we) is per-instruction, exactly
 // as in the original MAC4-only mac4_alu.sv.
+//
+// accept_i must be issue_valid_i && issue_ready_o, i.e. a genuine handshake
+// this cycle, not just "some instruction is currently offered at the issue
+// port". Without this gate, an instruction whose operands aren't
+// ready yet (register_i.rs_valid still low, so instr_decoder holds
+// issue_ready_o low while re-presenting the same opcode_i/registers_i every
+// cycle it waits) would be processed once per stall cycle instead of once.
+// MAC4 itself is a pure function of its operands, so re-processing the same
+// still-pending instruction is invisible (same result recomputed harmlessly)
+// -- but MAC_TILED's acc_n = acc_q + dot_sum is not idempotent: every extra
+// stall cycle before acceptance would silently add the same product into
+// the accumulator again. This only surfaces under real back-to-back
+// custom-instruction pressure (dozens of LOAD_STATIONARY/MAC_TILED calls in
+// a tight sequence, as convcellPropagate2 in NetworkPropagate.c now does),
+// not the sparser hand-written smoke test, which is why it wasn't caught
+// until real usage.
 
 module mac4_alu
   import mac4_instr_pkg::*;
@@ -26,6 +42,7 @@ module mac4_alu
     input  registers_t            registers_i,
     input  opcode_t               opcode_i,
     input  logic       [     6:0] funct7_i,
+    input  logic                  accept_i,
     input  hartid_t                hartid_i,
     input  id_t                   id_i,
     input  logic       [     4:0] rd_i,
@@ -116,56 +133,58 @@ module mac4_alu
     stationary_n = stationary_q;
     acc_n        = acc_q;
 
-    case (opcode_i)
-      MAC4: begin
-        result_n = dot_sum;
-        hartid_n = hartid_i;
-        id_n     = id_i;
-        valid_n  = 1'b1;
-        rd_n     = rd_i;
-        we_n     = 1'b1;
-      end
-      LOAD_STATIONARY: begin
-        stationary_n[mot_idx] = registers_i[0];
-        hartid_n = hartid_i;
-        id_n     = id_i;
-        valid_n  = 1'b1;
-        rd_n     = rd_i;
-        we_n     = 1'b0;
-      end
-      MAC_TILED: begin
-        acc_n[mac_tiled_slot] = acc_q[mac_tiled_slot] + dot_sum;
-        hartid_n = hartid_i;
-        id_n     = id_i;
-        valid_n  = 1'b1;
-        rd_n     = rd_i;
-        we_n     = 1'b0;
-      end
-      READ_ACC: begin
-        result_n = acc_q[read_acc_slot];
-        hartid_n = hartid_i;
-        id_n     = id_i;
-        valid_n  = 1'b1;
-        rd_n     = rd_i;
-        we_n     = 1'b1;
-      end
-      RESET_ACC: begin
-        for (int unsigned i = 0; i < T; i++) acc_n[i] = '0;
-        hartid_n = hartid_i;
-        id_n     = id_i;
-        valid_n  = 1'b1;
-        rd_n     = rd_i;
-        we_n     = 1'b0;
-      end
-      default: begin
-        result_n = '0;
-        hartid_n = '0;
-        id_n     = '0;
-        valid_n  = '0;
-        rd_n     = '0;
-        we_n     = '0;
-      end
-    endcase
+    if (accept_i) begin
+      case (opcode_i)
+        MAC4: begin
+          result_n = dot_sum;
+          hartid_n = hartid_i;
+          id_n     = id_i;
+          valid_n  = 1'b1;
+          rd_n     = rd_i;
+          we_n     = 1'b1;
+        end
+        LOAD_STATIONARY: begin
+          stationary_n[mot_idx] = registers_i[0];
+          hartid_n = hartid_i;
+          id_n     = id_i;
+          valid_n  = 1'b1;
+          rd_n     = rd_i;
+          we_n     = 1'b0;
+        end
+        MAC_TILED: begin
+          acc_n[mac_tiled_slot] = acc_q[mac_tiled_slot] + dot_sum;
+          hartid_n = hartid_i;
+          id_n     = id_i;
+          valid_n  = 1'b1;
+          rd_n     = rd_i;
+          we_n     = 1'b0;
+        end
+        READ_ACC: begin
+          result_n = acc_q[read_acc_slot];
+          hartid_n = hartid_i;
+          id_n     = id_i;
+          valid_n  = 1'b1;
+          rd_n     = rd_i;
+          we_n     = 1'b1;
+        end
+        RESET_ACC: begin
+          for (int unsigned i = 0; i < T; i++) acc_n[i] = '0;
+          hartid_n = hartid_i;
+          id_n     = id_i;
+          valid_n  = 1'b1;
+          rd_n     = rd_i;
+          we_n     = 1'b0;
+        end
+        default: begin
+          result_n = '0;
+          hartid_n = '0;
+          id_n     = '0;
+          valid_n  = '0;
+          rd_n     = '0;
+          we_n     = '0;
+        end
+      endcase
+    end
   end
 
   always_ff @(posedge clk_i, negedge rst_ni) begin

@@ -84,6 +84,14 @@ module mac4_coprocessor
   logic [6:0] funct7;
   assign funct7 = issue_req.instr[31:25];
 
+  // True only on a genuine issue handshake (valid && ready) this cycle, as
+  // opposed to "some instruction is currently offered but not yet
+  // accepted" (e.g. still waiting on register_i.rs_valid). See mac4_alu.sv
+  // for why mac4_alu must not process an opcode/registers snapshot that
+  // isn't backed by a real handshake.
+  logic accept;
+  assign accept = issue_valid && issue_ready;
+
   instr_decoder #(
       .copro_issue_resp_t(mac4_instr_pkg::copro_issue_resp_t),
       .opcode_t(mac4_instr_pkg::opcode_t),
@@ -125,6 +133,7 @@ module mac4_coprocessor
       .registers_i(registers),
       .opcode_i   (opcode),
       .funct7_i   (funct7),
+      .accept_i   (accept),
       .hartid_i   (issue_hartid),
       .id_i       (issue_id),
       .rd_i       (issue_rd),

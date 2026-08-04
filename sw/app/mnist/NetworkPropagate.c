@@ -10,6 +10,7 @@
 #include "env.h"
 #include "mem_info.h"
 #include "mac4.h"
+#include "utils.h"
 
 #include "conv1.h"
 #include "conv2.h"
@@ -242,6 +243,116 @@ static void convcellPropagate1(
         }
     }
 }
+
+// Accelerated conv2 path: input-stationary reuse across a tile of T=8
+// output channels (see mac4.h / core/mac4_copro for LOAD_STATIONARY,
+// MAC_TILED, READ_ACC, RESET_ACC), replacing convcellPropagate1's
+// per-output macsOnRange() loop with the tile-outer / sy-middle /
+// output-channel-inner order settled on by the mac4 v2 spec: for each tile
+// of T output channels, reset the hardware accumulators, then for each
+// kernel row (sy) load that row's input segment into the stationary buffer
+// once and MAC-tile it against all T channels' weights, then read back and
+// saturate each channel's accumulator only after the sy sweep completes --
+// no partial sum ever goes back to memory between sy's.
+//
+// This hardcodes CONV2_* rather than taking them as parameters (unlike
+// convcellPropagate1): mac4_load_stationary()/mac4_tiled() encode their
+// "mot" word index as a compile-time immediate, so the segment-word loop
+// must be a genuine integer constant expression, not something that merely
+// happens to fold to a constant after inlining. Valid only where conv2's
+// actual shape holds: contiguous input segment (NB_CHANNELS ==
+// INPUT_MEM_STRIDE, no padding/partial window -- true for conv2, verified
+// against CONV2_PADDING_X/Y and CONV2_OUTPUTS_*_NOPAD), a segment length
+// that's an exact multiple of 4 bytes (KERNEL_WIDTH*NB_CHANNELS = 80 = 20
+// words, no scalar remainder), and NB_OUTPUTS an exact multiple of T=8 (24 =
+// 3 tiles, no partial tile). conv1 and fc1/fc2 don't meet this (or aren't
+// converted yet) and keep using convcellPropagate1/macsOnRange as before --
+// see ticket #28 for conv1's own dedicated treatment.
+#define CONV2_SEGMENT_WORDS ((CONV2_KERNEL_WIDTH * CONV2_NB_CHANNELS) / 4)
+
+// The _Pragma("GCC unroll N") literals below must equal CONV2_SEGMENT_WORDS
+// and MAC4_NUM_ACC_SLOTS exactly, and CONV2_NB_OUTPUTS must divide evenly by
+// MAC4_NUM_ACC_SLOTS (no partial last tile -- convcellPropagate2 below has
+// no bounds check on the last tile's slot range, matching the fixed-T=8
+// hardware). None of this is re-derivable by the compiler across a
+// _Pragma's string argument, so catch drift here instead of silently
+// under-unrolling (reintroducing the "impossible constraint in asm" class
+// of bug) or writing outputs[]/biasses[] out of bounds.
+#if CONV2_SEGMENT_WORDS != 20
+#error "CONV2_SEGMENT_WORDS changed: update the _Pragma(\"GCC unroll 20\") literals in convcellPropagate2 to match"
+#endif
+#if (CONV2_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS) != 0
+#error "CONV2_NB_OUTPUTS is no longer an exact multiple of MAC4_NUM_ACC_SLOTS: convcellPropagate2's last tile would read/write out of bounds"
+#endif
+
+#define CONV2_MAC_TILE_SLOT(SLOT, TILE_BASE)                                 \
+    {                                                                        \
+        const int wOffset = wOffsetSyTerm + CONV2_NB_CHANNELS               \
+            * CONV2_KERNEL_WIDTH * CONV2_KERNEL_HEIGHT * ((TILE_BASE) + (SLOT)); \
+        _Pragma("GCC unroll 20")                                            \
+        for (int w = 0; w < CONV2_SEGMENT_WORDS; ++w) {                     \
+            uint32_t weight_word;                                           \
+            memcpy(&weight_word, weights + wOffset + 4 * w,                 \
+                   sizeof(weight_word));                                    \
+            mac4_tiled(weight_word, w, SLOT);                               \
+        }                                                                   \
+    }
+
+static void convcellPropagate2(
+    const UDATA_T* __restrict inputs,
+    UDATA_T* __restrict outputs,
+    const BDATA_T* __restrict biasses,
+    const WDATA_T* __restrict weights,
+    int rescaling)
+{
+    for (int oy = 0; oy < CONV2_OUTPUTS_HEIGHT; ++oy) {
+        const int iy = oy * CONV2_STRIDE_Y;
+
+        for (int ox = 0; ox < CONV2_OUTPUTS_WIDTH; ++ox) {
+            const int ix = ox * CONV2_STRIDE_X;
+            const int oOffset = CONV2_MEM_STRIDE * (ox + CONV2_OUTPUTS_WIDTH * oy);
+
+            for (int tile_base = 0; tile_base < CONV2_NB_OUTPUTS;
+                    tile_base += MAC4_NUM_ACC_SLOTS) {
+                mac4_reset_acc();
+
+                for (int sy = 0; sy < CONV2_KERNEL_HEIGHT; ++sy) {
+                    int iOffset = CONV1_MEM_STRIDE
+                        * (ix + CONV2_CHANNELS_WIDTH * (iy + sy));
+
+                    if (iOffset >= CONV1_MEM_CONT_SIZE) {
+                        iOffset += CONV1_MEM_WRAP_OFFSET - CONV1_MEM_CONT_OFFSET
+                                    - CONV1_MEM_CONT_SIZE;
+                    }
+
+                    _Pragma("GCC unroll 20")
+                    for (int w = 0; w < CONV2_SEGMENT_WORDS; ++w) {
+                        uint32_t input_word;
+                        memcpy(&input_word, inputs + iOffset + 4 * w,
+                               sizeof(input_word));
+                        mac4_load_stationary(input_word, w);
+                    }
+
+                    const int wOffsetSyTerm
+                        = CONV2_NB_CHANNELS * CONV2_KERNEL_WIDTH * sy;
+
+                    EVAL(REPEAT(MAC4_NUM_ACC_SLOTS, CONV2_MAC_TILE_SLOT, tile_base))
+                }
+
+                _Pragma("GCC unroll 8")
+                for (int slot = 0; slot < MAC4_NUM_ACC_SLOTS; ++slot) {
+                    const int output = tile_base + slot;
+                    SUM_T weightedSum = biasses[output] + mac4_read_acc(slot);
+                    outputs[oOffset + output]
+                        = sat(weightedSum, output, CONV2_ACTIVATION, rescaling);
+                }
+            }
+        }
+    }
+}
+
+#undef CONV2_MAC_TILE_SLOT
+#undef CONV2_SEGMENT_WORDS
 
 static void fccellPropagateUDATA_T(
     const UDATA_T* __restrict inputs,
@@ -492,16 +603,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
 
     const unsigned long start_conv2 = read_csr(mcycle);
 
-    convcellPropagate1(conv1_output , conv2_output, conv2_biases, conv2_weights, 8,
-    CONV2_NB_CHANNELS, CONV2_CHANNELS_HEIGHT, CONV2_CHANNELS_WIDTH, 
-    CONV2_NB_OUTPUTS, CONV2_OUTPUTS_HEIGHT, CONV2_OUTPUTS_WIDTH, 
-    CONV2_PADDING_Y, CONV2_PADDING_X, CONV2_STRIDE_Y, CONV2_STRIDE_X, 
-    CONV2_KERNEL_HEIGHT, CONV2_KERNEL_WIDTH, CONV2_ACTIVATION, CONV1_MEM_CONT_OFFSET, 
-    CONV1_MEM_CONT_SIZE, CONV1_MEM_WRAP_OFFSET, CONV1_MEM_WRAP_SIZE, 
-    CONV1_MEM_STRIDE, CONV2_MEM_CONT_OFFSET, CONV2_MEM_CONT_SIZE, CONV2_MEM_WRAP_OFFSET, 
-    CONV2_MEM_WRAP_SIZE, CONV2_MEM_STRIDE);
-
-    //convcellPropagate2(conv1_output , conv2_output, conv2_biases, conv2_weights, CONV2_SCALING);
+    convcellPropagate2(conv1_output , conv2_output, conv2_biases, conv2_weights, 8);
 
     printf("conv2: %lu cycles\n", read_csr(mcycle) - start_conv2);
 
