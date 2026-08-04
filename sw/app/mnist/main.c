@@ -1,11 +1,37 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdint.h>
 
 #include "cpp_utils.h"
 #include "env.h"
 #include "Network.h"
 #include "util.h"
+
+// MAC4 custom instruction: rd = sum_{i=0..3}( uint8(rs1[8*i+:8]) * int8(rs2[8*i+:8]) )
+// R-type encoding: opcode = custom-0 (0x0B), funct3 = 0, funct7 = 0.
+static inline int32_t mac4(uint32_t packed_inputs, uint32_t packed_weights) {
+    int32_t result;
+    __asm__ volatile (
+        ".insn r 0x0B, 0, 0, %0, %1, %2"
+        : "=r"(result)
+        : "r"(packed_inputs), "r"(packed_weights)
+    );
+    return result;
+}
+
+// Standalone correctness check for the MAC4 coprocessor, independent of the
+// real inference path (macsOnRange() is untouched by this ticket).
+static int mac4_smoke_test(void) {
+    const uint32_t packed_inputs  = 0x04030201u;  // lanes (uint8): 1, 2, 3, 4
+    const uint32_t packed_weights = 0xF807FA05u;  // lanes (int8): 5, -6, 7, -8
+    const int32_t expected = 1*5 + 2*(-6) + 3*7 + 4*(-8);  // -18
+
+    const int32_t got = mac4(packed_inputs, packed_weights);
+    const int pass = (got == expected);
+    printf("MAC4 smoke test: %s (expected %d, got %d)\n", pass ? "PASS" : "FAIL", (int)expected, (int)got);
+    return pass;
+}
 
 void readStimulus(
                   UDATA_T* inputBuffer,
@@ -57,6 +83,8 @@ int main(int argc, char* argv[]) {
     Target_T expectedOutputBuffer[OUTPUTS_SIZE[0]];
     Target_T predictedOutputBuffer[OUTPUTS_SIZE[0]];
     UDATA_T output_value;
+
+    mac4_smoke_test();
 
     readStimulus(inputBuffer, expectedOutputBuffer);
     instret = -read_csr(minstret);

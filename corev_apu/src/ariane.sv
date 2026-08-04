@@ -108,8 +108,8 @@ module ariane import ariane_pkg::*; #(
     .noc_resp_i           ( noc_resp_i                )
   );
 
-  if (CVA6Cfg.CvxifEn) begin : gen_example_coprocessor
-    cvxif_example_coprocessor #(
+  if (CVA6Cfg.CvxifEn) begin : gen_mac4_coprocessor
+    mac4_coprocessor #(
       .NrRgprPorts (CVA6Cfg.NrRgprPorts),
       .XLEN (CVA6Cfg.XLEN),
       .readregflags_t (readregflags_t),
@@ -125,7 +125,7 @@ module ariane import ariane_pkg::*; #(
       .x_result_t (x_result_t),
       .cvxif_req_t (cvxif_req_t),
       .cvxif_resp_t (cvxif_resp_t)
-    ) i_cvxif_coprocessor (
+    ) i_mac4_coprocessor (
       .clk_i                ( clk_i                          ),
       .rst_ni               ( rst_ni                         ),
       .cvxif_req_i          ( cvxif_req                      ),
