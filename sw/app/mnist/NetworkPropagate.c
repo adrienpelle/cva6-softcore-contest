@@ -14,7 +14,7 @@
 #include "fc2.h"
 
 
-static DATA_T mem[MEMORY_SIZE];
+static DATA_T mem[MEMORY_SIZE] __attribute__((aligned(4)));
 
 static int max(int lhs, int rhs) {
         return (lhs >= rhs)?lhs:rhs;

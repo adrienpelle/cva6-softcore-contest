@@ -26,7 +26,7 @@ static const BDATA_T fc1_biases[FC1_OUTPUTS_SIZE] = {0 + 128, 0 + 128, 0 + 128, 
 
 // Flatten weights with the order[OUTPUTS_SIZE][CHANNELS_SIZE]. 
 // If the previous cell was a 2D cell, CHANNELS_SIZE is flatten in the [CHANNELS_HEIGHT][CHANNELS_WIDTH][NB_CHANNELS] order.
-static const WDATA_T fc1_weights[FC1_WEIGHTS_SIZE] = {
+static const WDATA_T fc1_weights[FC1_WEIGHTS_SIZE] __attribute__((aligned(4))) = {
 14, -22, 12, 11, -11, 6, -9, -16, 2, -12, 13, -22, -6, -10, 7, 5, 10, 10, 11, 8, 15, 12, -38, -11, 7, -23, 20, 11, 0, -10, 
 10, -4, -10, 8, -10, -3, -3, 8, -11, -16, 8, 9, 4, 19, -5, 11, -16, -6, 8, 23, 2, 14, -8, -2, -3, -11, -1, -5, -14, 10, 
 1, 3, 0, -28, 20, 1, 9, 7, -13, 2, 19, -12, 2, 14, 6, -4, 10, -2, -10, -11, 11, 2, 3, -3, 2, -3, 3, -22, -1, 10, 
