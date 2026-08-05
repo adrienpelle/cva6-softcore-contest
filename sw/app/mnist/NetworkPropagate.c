@@ -20,9 +20,12 @@
 
 static DATA_T mem[MEMORY_SIZE] __attribute__((aligned(4)));
 
-static int max(int lhs, int rhs) {
-        return (lhs >= rhs)?lhs:rhs;
-    }
+// conv1 alignment fix (see convcellPropagate3): the env image shifted left
+// by 2 bytes, rebuilt once per propagate() call. Only indices [0,
+// ENV_MEM_CONT_SIZE - 2) are ever populated/read -- conv1's kernel never
+// reaches the last 2 source bytes through this copy (verified against
+// CONV1_CHANNELS_WIDTH/CONV1_OUTPUTS_WIDTH/CONV1_KERNEL_WIDTH).
+static UDATA_T conv1_input_shifted[ENV_MEM_CONT_SIZE] __attribute__((aligned(4)));
 
 static int clamp(int v, int lo, int hi) {
     if(v < lo) {
@@ -101,153 +104,113 @@ static UDATA_T sat(SUM_T weightedSum, int output,
     return saturate(weightedSum>>shift, NB_BITS);
 }
 
-static void convcellPropagate1(
+// Accelerated conv1 path (ticket #28): same tile-outer / sy-middle /
+// output-channel-inner MAC4 v2 order as convcellPropagate2 below, but with
+// two conv1-specific corrections on top:
+//
+// 1. Alignment: conv1 reads directly from the raw env image (ENV_MEM_STRIDE
+//    = 1, single channel), so a kernel row's 4 bytes (KERNEL_WIDTH *
+//    CONV1_NB_CHANNELS) start at `ix = ox * CONV1_STRIDE_X`, which is
+//    4-byte aligned only for even ox (ix % 4 == 0) -- odd ox lands on ix % 4
+//    == 2. conv1_input_shifted holds the same image shifted left by 2
+//    bytes, rebuilt once per propagate() call; reading it at (ix - 2)
+//    recovers the identical 4 bytes through an address that IS 4-byte
+//    aligned. So every (oy, ox) picks one of two already-aligned sources --
+//    never a genuinely misaligned lw, and 100% of kernel-row reads take the
+//    fast path (vs. ~50% before this ticket, when only even ox did).
+// 2. Codegen: that choice of source/base offset is made once per (oy, ox)
+//    below (input_base/ix_base), not re-tested per sy or per output the way
+//    macsOnRange()'s runtime alignment check was.
+//
+// CONV1_NB_OUTPUTS (16) is an exact multiple of T=8 (2 tiles, no partial
+// tile) and KERNEL_WIDTH * NB_CHANNELS is exactly 4 bytes (one MAC4 group,
+// no segment-word loop needed) -- both guarded by the #if checks below so a
+// future shape change fails to compile instead of silently corrupting
+// output.
+#if (CONV1_KERNEL_WIDTH * CONV1_NB_CHANNELS) != 4
+#error "conv1 kernel row is no longer exactly 4 bytes (one MAC4 group): convcellPropagate3's single mac4_load_stationary/mac4_tiled call no longer covers the whole row"
+#endif
+#if (CONV1_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS) != 0
+#error "CONV1_NB_OUTPUTS is no longer an exact multiple of MAC4_NUM_ACC_SLOTS: convcellPropagate3's last tile would read/write out of bounds"
+#endif
+
+#define CONV1_MAC_TILE_SLOT(SLOT, TILE_BASE)                                \
+    {                                                                       \
+        const int wOffset = wOffsetSyTerm + CONV1_NB_CHANNELS               \
+            * CONV1_KERNEL_WIDTH * CONV1_KERNEL_HEIGHT * ((TILE_BASE) + (SLOT)); \
+        uint32_t weight_word;                                              \
+        memcpy(&weight_word, weights + wOffset, sizeof(weight_word));      \
+        mac4_tiled(weight_word, 0, SLOT);                                  \
+    }
+
+static void convcellPropagate3(
     const UDATA_T* __restrict inputs,
     UDATA_T* __restrict outputs,
     const BDATA_T* __restrict biasses,
     const WDATA_T* __restrict weights,
-    int rescaling,
-    int NB_CHANNELS, 
-    int CHANNELS_HEIGHT, int CHANNELS_WIDTH,
-    int NB_OUTPUTS,
-    int OUTPUTS_HEIGHT, int OUTPUTS_WIDTH,
-    int PADDING_Y, int PADDING_X,
-    int STRIDE_Y, int STRIDE_X,
-    int KERNEL_HEIGHT, int KERNEL_WIDTH,
-    ActivationFunction_T ACTIVATION,
-    // Memory mapping: inputs
-    int INPUT_MEM_CONT_OFFSET,
-    int INPUT_MEM_CONT_SIZE,
-    int INPUT_MEM_WRAP_OFFSET,
-    int INPUT_MEM_WRAP_SIZE,
-    int INPUT_MEM_STRIDE,
-    // Memory mapping: outputs
-    int OUTPUT_MEM_CONT_OFFSET,
-    int OUTPUT_MEM_CONT_SIZE,
-    int OUTPUT_MEM_WRAP_OFFSET,
-    int OUTPUT_MEM_WRAP_SIZE,
-    int OUTPUT_MEM_STRIDE)
+    int rescaling)
 {
-    int OUTPUTS_HEIGHT_NOPAD
-        = (CHANNELS_HEIGHT - KERNEL_HEIGHT + STRIDE_Y) / STRIDE_Y;
-    int OUTPUTS_WIDTH_NOPAD
-        = (CHANNELS_WIDTH - KERNEL_WIDTH + STRIDE_X) / STRIDE_X;
+    for (int oy = 0; oy < CONV1_OUTPUTS_HEIGHT; ++oy) {
+        const int iy = oy * CONV1_STRIDE_Y;
 
-    for (int oy = 0; oy < OUTPUTS_HEIGHT; ++oy) {
-        const int syMin = (PADDING_Y == 0) ? 0
-            : max(PADDING_Y - (oy * STRIDE_Y), 0);
-        const int syMax = (PADDING_Y == 0
-                && OUTPUTS_HEIGHT == OUTPUTS_HEIGHT_NOPAD) ? KERNEL_HEIGHT
-            : clamp(CHANNELS_HEIGHT + PADDING_Y - (oy * STRIDE_Y), 
-                    0, KERNEL_HEIGHT);
-        const int iy = (oy * STRIDE_Y) - PADDING_Y;
+        for (int ox = 0; ox < CONV1_OUTPUTS_WIDTH; ++ox) {
+            const int ix = ox * CONV1_STRIDE_X;
 
-        for (int ox = 0; ox < OUTPUTS_WIDTH; ++ox) {
-            for (int output = 0; output < NB_OUTPUTS; ++output) {
-                // moved to inner loop for collapsing -->
-                const int sxMin = (PADDING_X == 0) ? 0
-                    : max(PADDING_X - (ox * STRIDE_X), 0);
-                const int sxMax = (PADDING_X == 0
-                        && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
-                            ? KERNEL_WIDTH
-                    : clamp(CHANNELS_WIDTH + PADDING_X - (ox * STRIDE_X), 
-                            0, KERNEL_WIDTH);
-                const int ix = (ox * STRIDE_X) - PADDING_X;
+            int oOffset = CONV1_MEM_STRIDE * (ox + CONV1_OUTPUTS_WIDTH * oy);
+            if (oOffset >= CONV1_MEM_CONT_SIZE) {
+                oOffset += CONV1_MEM_WRAP_OFFSET - CONV1_MEM_CONT_OFFSET
+                            - CONV1_MEM_CONT_SIZE;
+            }
 
-                const int oPos = (ox + OUTPUTS_WIDTH * oy);
-                int oOffset = OUTPUT_MEM_STRIDE * oPos;
+            // Alignment test hoisted here: once per (oy, ox), not once per
+            // sy/output the way the generic macsOnRange() path did it.
+            const UDATA_T* __restrict input_base;
+            int ix_base;
+            if (ox & 1) {
+                input_base = conv1_input_shifted;
+                ix_base = ix - 2;
+            } else {
+                input_base = inputs;
+                ix_base = ix;
+            }
 
-                if (OUTPUT_MEM_WRAP_SIZE > 0 && oOffset >= OUTPUT_MEM_CONT_SIZE) {
-                    oOffset += OUTPUT_MEM_WRAP_OFFSET - OUTPUT_MEM_CONT_OFFSET
-                                - OUTPUT_MEM_CONT_SIZE;
-                }
-                // <--
+            for (int tile_base = 0; tile_base < CONV1_NB_OUTPUTS;
+                    tile_base += MAC4_NUM_ACC_SLOTS) {
+                mac4_reset_acc();
 
-                SUM_T weightedSum = biasses[output];
+                for (int sy = 0; sy < CONV1_KERNEL_HEIGHT; ++sy) {
+                    const int iOffset = ix_base
+                        + CONV1_CHANNELS_WIDTH * (iy + sy);
 
-                for (int sy = 0; sy < KERNEL_HEIGHT; ++sy) {
-                    if ((PADDING_Y != 0
-                            || OUTPUTS_HEIGHT != OUTPUTS_HEIGHT_NOPAD)
-                        && sy >= syMax - syMin)
-                    {
-                        break;
-                    }
+                    uint32_t input_word;
+                    memcpy(&input_word, input_base + iOffset,
+                           sizeof(input_word));
+                    mac4_load_stationary(input_word, 0);
 
-                    const int iPos = ((sxMin + ix)
-                                        + CHANNELS_WIDTH * (iy + syMin + sy));
-                    int iOffset = INPUT_MEM_STRIDE * iPos;
+                    const int wOffsetSyTerm
+                        = CONV1_NB_CHANNELS * CONV1_KERNEL_WIDTH * sy;
 
-                    // Wrapping cannot occur in the middle of a line, except if
-                    // there is only one line (1D)!
-                    bool wrapInRange = false;
-
-                    if (INPUT_MEM_WRAP_SIZE > 0
-                        && iOffset >= INPUT_MEM_CONT_SIZE)
-                    {
-                        iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
-                                    - INPUT_MEM_CONT_SIZE;
-                    }
-                    else if (INPUT_MEM_WRAP_SIZE > 0 && KERNEL_WIDTH > 1
-                        && CHANNELS_HEIGHT == 1 // single line (1D)!
-                        && iOffset + KERNEL_WIDTH * NB_CHANNELS
-                            > INPUT_MEM_CONT_SIZE)
-                    {
-                        wrapInRange = true;
-                    }
-
-                    const int wOffset = NB_CHANNELS * (sxMin
-                        + KERNEL_WIDTH * (syMin + sy + KERNEL_HEIGHT * output));
-
-                    if (!wrapInRange && (NB_CHANNELS == INPUT_MEM_STRIDE
-                        && ((PADDING_X == 0
-                            && OUTPUTS_WIDTH == OUTPUTS_WIDTH_NOPAD)
-                                || sxMax - sxMin == KERNEL_WIDTH)))
-                    {
-                        macsOnRange(
-                            inputs + iOffset, 
-                            weights + wOffset, 
-                            &weightedSum,KERNEL_WIDTH * NB_CHANNELS);
-                    }
-                    else {
-                        for (int sx = 0; sx < KERNEL_WIDTH; ++sx) {
-                            if ((PADDING_X != 0
-                                    || OUTPUTS_WIDTH != OUTPUTS_WIDTH_NOPAD)
-                                && sx >= sxMax - sxMin)
-                            {
-                                break;
-                            }
-
-                            int iOffsetInRange = iOffset
-                                + sx * INPUT_MEM_STRIDE;
-
-                            if (wrapInRange
-                                && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
-                            {
-                                iOffsetInRange += INPUT_MEM_WRAP_OFFSET
-                                            - INPUT_MEM_CONT_OFFSET
-                                            - INPUT_MEM_CONT_SIZE;
-                            }
-
-                            macsOnRange(
-                                // same input line so no wrapping can occur
-                                inputs + iOffsetInRange, 
-                                weights + wOffset + sx * NB_CHANNELS, 
-                                &weightedSum,NB_CHANNELS);
-                        }
-                    }
+                    EVAL(REPEAT(MAC4_NUM_ACC_SLOTS, CONV1_MAC_TILE_SLOT, tile_base))
                 }
 
-                outputs[oOffset + output]
-                    = sat(weightedSum, output, ACTIVATION, rescaling);
+                _Pragma("GCC unroll 8")
+                for (int slot = 0; slot < MAC4_NUM_ACC_SLOTS; ++slot) {
+                    const int output = tile_base + slot;
+                    SUM_T weightedSum = biasses[output] + mac4_read_acc(slot);
+                    outputs[oOffset + output]
+                        = sat(weightedSum, output, CONV1_ACTIVATION, rescaling);
+                }
             }
         }
     }
 }
 
+#undef CONV1_MAC_TILE_SLOT
+
 // Accelerated conv2 path: input-stationary reuse across a tile of T=8
 // output channels (see mac4.h / core/mac4_copro for LOAD_STATIONARY,
-// MAC_TILED, READ_ACC, RESET_ACC), replacing convcellPropagate1's
-// per-output macsOnRange() loop with the tile-outer / sy-middle /
+// MAC_TILED, READ_ACC, RESET_ACC), replacing the generic per-output
+// macsOnRange() loop with the tile-outer / sy-middle /
 // output-channel-inner order settled on by the mac4 v2 spec: for each tile
 // of T output channels, reset the hardware accumulators, then for each
 // kernel row (sy) load that row's input segment into the stationary buffer
@@ -255,19 +218,22 @@ static void convcellPropagate1(
 // saturate each channel's accumulator only after the sy sweep completes --
 // no partial sum ever goes back to memory between sy's.
 //
-// This hardcodes CONV2_* rather than taking them as parameters (unlike
-// convcellPropagate1): mac4_load_stationary()/mac4_tiled() encode their
-// "mot" word index as a compile-time immediate, so the segment-word loop
-// must be a genuine integer constant expression, not something that merely
-// happens to fold to a constant after inlining. Valid only where conv2's
-// actual shape holds: contiguous input segment (NB_CHANNELS ==
-// INPUT_MEM_STRIDE, no padding/partial window -- true for conv2, verified
-// against CONV2_PADDING_X/Y and CONV2_OUTPUTS_*_NOPAD), a segment length
-// that's an exact multiple of 4 bytes (KERNEL_WIDTH*NB_CHANNELS = 80 = 20
-// words, no scalar remainder), and NB_OUTPUTS an exact multiple of T=8 (24 =
-// 3 tiles, no partial tile). conv1 and fc1/fc2 don't meet this (or aren't
-// converted yet) and keep using convcellPropagate1/macsOnRange as before --
-// see ticket #28 for conv1's own dedicated treatment.
+// This hardcodes CONV2_* rather than taking them as parameters (unlike the
+// generic macsOnRange() callers below): mac4_load_stationary()/mac4_tiled()
+// encode their "mot" word index as a compile-time immediate, so the
+// segment-word loop must be a genuine integer constant expression, not
+// something that merely happens to fold to a constant after inlining. Valid
+// only where conv2's actual shape holds: contiguous input segment
+// (NB_CHANNELS == INPUT_MEM_STRIDE, no padding/partial window -- true for
+// conv2, verified against CONV2_PADDING_X/Y and CONV2_OUTPUTS_*_NOPAD), a
+// segment length that's an exact multiple of 4 bytes
+// (KERNEL_WIDTH*NB_CHANNELS = 80 = 20 words, no scalar remainder), and
+// NB_OUTPUTS an exact multiple of T=8 (24 = 3 tiles, no partial tile). conv1
+// got its own dedicated treatment above (convcellPropagate3, ticket #28: a
+// single mac4 group per kernel row plus a shifted input copy for alignment,
+// rather than a segment-word loop). fc1/fc2 don't meet the exact-multiple-
+// of-T requirement (150 % 8 == 6, 10 % 8 == 2) and keep using macsOnRange as
+// before.
 #define CONV2_SEGMENT_WORDS ((CONV2_KERNEL_WIDTH * CONV2_NB_CHANNELS) / 4)
 
 // The _Pragma("GCC unroll N") literals below must equal CONV2_SEGMENT_WORDS
@@ -574,18 +540,15 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
     saveOutputs(ENV_NB_OUTPUTS, ENV_SIZE_Y, ENV_SIZE_X, ENV_MEM_CONT_OFFSET, ENV_MEM_CONT_SIZE, ENV_MEM_WRAP_OFFSET, ENV_MEM_WRAP_SIZE, ENV_MEM_STRIDE, inputs, env_stream, Network::Format::CHW);
     fclose(env_stream);
 #endif
+    // conv1 alignment fix (ticket #28): see convcellPropagate3.
+    memcpy(conv1_input_shifted, inputs + 2, ENV_MEM_CONT_SIZE - 2);
+
     // conv1
     UDATA_T* conv1_output = (UDATA_T*) mem + CONV1_MEM_CONT_OFFSET;
 
     const unsigned long start_conv1 = read_csr(mcycle);
 
-    convcellPropagate1(inputs , conv1_output, conv1_biases, conv1_weights, 8,
-    CONV1_NB_CHANNELS, CONV1_CHANNELS_HEIGHT, CONV1_CHANNELS_WIDTH, CONV1_NB_OUTPUTS, CONV1_OUTPUTS_HEIGHT, 
-    CONV1_OUTPUTS_WIDTH, CONV1_PADDING_Y, CONV1_PADDING_X, CONV1_STRIDE_Y, CONV1_STRIDE_X, CONV1_KERNEL_HEIGHT, 
-    CONV1_KERNEL_WIDTH, CONV1_ACTIVATION, ENV_MEM_CONT_OFFSET, ENV_MEM_CONT_SIZE, ENV_MEM_WRAP_OFFSET, 
-    ENV_MEM_WRAP_SIZE, ENV_MEM_STRIDE, CONV1_MEM_CONT_OFFSET, CONV1_MEM_CONT_SIZE, CONV1_MEM_WRAP_OFFSET, CONV1_MEM_WRAP_SIZE, CONV1_MEM_STRIDE);
-
-    //convcellPropagate1(inputs , conv1_output, conv1_biases, conv1_weights, CONV1_SCALING);
+    convcellPropagate3(inputs, conv1_output, conv1_biases, conv1_weights, 8);
 
     printf("conv1: %lu cycles\n", read_csr(mcycle) - start_conv1);
 

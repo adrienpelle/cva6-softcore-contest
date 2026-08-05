@@ -36,7 +36,7 @@ static const BDATA_T conv1_biases[CONV1_NB_OUTPUTS] = {0 + 128, 0 + 128, 0 + 128
 #define CONV1_WEIGHTS_SIZE (CONV1_NB_OUTPUTS*CONV1_KERNEL_WIDTH*CONV1_KERNEL_HEIGHT*CONV1_NB_CHANNELS)
 
 // Flatten weights with the order [NB_OUTPUTS][KERNEL_HEIGHT][KERNEL_WIDTH][NB_CHANNELS]
-static const WDATA_T conv1_weights[CONV1_WEIGHTS_SIZE] = {13, 8, -6, -3, -10, -10, 1, 5, -4, 1, -5, 7, -2, -2, -6, -14, 6, -10, -7, -21, -32, -38, -40, -40, 
+static const WDATA_T conv1_weights[CONV1_WEIGHTS_SIZE] __attribute__((aligned(4))) = {13, 8, -6, -3, -10, -10, 1, 5, -4, 1, -5, 7, -2, -2, -6, -14, 6, -10, -7, -21, -32, -38, -40, -40, 
 -42, -15, 9, 2, 17, 42, 37, 51, -45, -58, -61, -46, -7, -1, -6, -9, 35, 40, 47, 36, 16, 10, 17, 11, 
 -33, -15, 6, 37, -33, -17, 13, 44, -31, -15, 29, 28, -30, -14, 5, 26, -13, 0, 10, 11, -28, -21, 24, 21, 
 -27, 2, 23, 12, 0, -7, 13, -3, -5, 1, 22, 32, 0, -2, -13, 2, 1, -18, -38, -29, 3, 14, 25, 0, 

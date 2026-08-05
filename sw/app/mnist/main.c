@@ -109,7 +109,11 @@ int main(int argc, char* argv[]) {
     size_t instret, cycles;
 
 #if ENV_DATA_UNSIGNED
-    UDATA_T inputBuffer[ENV_SIZE_Y*ENV_SIZE_X*ENV_NB_OUTPUTS];
+    // aligned(4): conv1's accelerated path (convcellPropagate3) reads this
+    // buffer directly via a single lw for even output columns -- an
+    // unaligned base here would turn that into a genuinely misaligned
+    // access, which hangs this core indefinitely (core/load_store_unit.sv).
+    UDATA_T inputBuffer[ENV_SIZE_Y*ENV_SIZE_X*ENV_NB_OUTPUTS] __attribute__((aligned(4)));
 #else
     std::vector<DATA_T> inputBuffer(network.inputSize());
 #endif
