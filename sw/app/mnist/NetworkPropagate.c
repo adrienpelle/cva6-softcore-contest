@@ -144,7 +144,8 @@ static void convcellPropagate3(
                         + CONV1_CHANNELS_WIDTH * (iy + sy);
 
                     uint32_t input_word;
-                    memcpy(&input_word, input_base + iOffset,
+                    memcpy(&input_word,
+                           __builtin_assume_aligned(input_base + iOffset, 4),
                            sizeof(input_word));
                     mac4_load_stationary(input_word, 0);
 
