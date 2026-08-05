@@ -137,7 +137,23 @@
 #define INC_13 14
 #define INC_14 15
 #define INC_15 16
-#define INC_16 16
+#define INC_16 17
+#define INC_17 18
+#define INC_18 19
+#define INC_19 20
+#define INC_20 21
+#define INC_21 22
+#define INC_22 23
+#define INC_23 24
+#define INC_24 25
+#define INC_25 26
+#define INC_26 27
+#define INC_27 28
+#define INC_28 29
+#define INC_29 30
+#define INC_30 31
+#define INC_31 32
+#define INC_32 32
 
 #define DEC(x) PRIMITIVE_CAT(DEC_, x)
 #define DEC_0 0
@@ -157,6 +173,27 @@
 #define DEC_14 13
 #define DEC_15 14
 #define DEC_16 15
+// Extended from 16 to 32 (ticket "Coprocesseur MAC4 v3", map #2): REPEAT()
+// now needs to unroll the accumulator-slot dimension up to
+// MAC4_NUM_ACC_SLOTS=32, and its DEC() recursion needs an entry for every
+// count it's ever called with, same reason the original table stopped at 16
+// (T=8's SLOT-dimension REPEAT calls never needed more).
+#define DEC_17 16
+#define DEC_18 17
+#define DEC_19 18
+#define DEC_20 19
+#define DEC_21 20
+#define DEC_22 21
+#define DEC_23 22
+#define DEC_24 23
+#define DEC_25 24
+#define DEC_26 25
+#define DEC_27 26
+#define DEC_28 27
+#define DEC_29 28
+#define DEC_30 29
+#define DEC_31 30
+#define DEC_32 31
 
 #define ADD(x, y) PRIMITIVE_CAT(ADD_, x)(y)
 #define ADD_0(x) x

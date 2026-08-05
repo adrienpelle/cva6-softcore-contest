@@ -55,11 +55,22 @@ module mac4_alu
 );
 
   // T = number of parallel output-channel accumulators (tiling factor).
+  // T=32 = channel-tile(8) x spatial-batch(4): weight-spatial-batching
+  // (map #2, ticket "Coprocesseur MAC4 v3") keeps a weight word live in a
+  // GPR across MAC_TILED calls to 4 spatial output positions per output
+  // channel, needing one accumulator per (position, channel-in-tile) pair
+  // live at once -- see docs/research/weight-spatial-batching-tradeoff.md
+  // for why this is T x B, not NB_OUTPUTS x B.
   // StationaryWords = depth of the stationary input buffer, sized to the
-  // 6-bit word index carried in funct7_i[5:0]/funct7_i (0..63), comfortably
-  // covering the largest segment encountered (~38 words for fc2).
-  localparam int unsigned T = 8;
-  localparam int unsigned StationaryWords = 64;
+  // widened 7-bit word index carried in funct7_i[6:0] (0..127 addressable),
+  // built to exactly 80 words -- 4 spatial positions x conv2's 20-word
+  // segment, the largest batch this map's B=4 decision needs. Deliberately
+  // not built out to the full 128 the address width can now reach: no B>4
+  // batching is speced (spec #34 explicitly leaves B=8/B=16 out of scope,
+  // since those need a real new instruction encoding, not just wider
+  // fields), so paying for unused array depth isn't justified.
+  localparam int unsigned T = 32;
+  localparam int unsigned StationaryWords = 80;
 
   logic [XLEN-1:0] result_n, result_q;
   hartid_t hartid_n, hartid_q;
@@ -80,15 +91,25 @@ module mac4_alu
   assign we_o     = we_q;
 
   // Word index into the stationary buffer (LOAD_STATIONARY writes it,
-  // MAC_TILED reads it) and accumulator slot indices. rd_i[2:0] is reused as
+  // MAC_TILED reads it) and accumulator slot indices. rd_i[4:0] is reused as
   // MAC_TILED's target slot: MAC_TILED has no real destination register
   // (writeback = 0), so the rd field only ever carries this slot index.
-  logic [5:0] mot_idx;
-  logic [2:0] mac_tiled_slot;
-  logic [2:0] read_acc_slot;
-  assign mot_idx        = funct7_i[5:0];
-  assign mac_tiled_slot = rd_i[2:0];
-  assign read_acc_slot  = funct7_i[2:0];
+  // Both fields widened for T=32/StationaryWords=80 (see localparams above):
+  // mot_idx needs 7 bits to address up to 79; the slot fields need 5 bits to
+  // address up to 31. Neither widening changes the instruction encoding --
+  // funct7_i/rd_i already carry their full RISC-V field width at this
+  // module's ports (see mac4_coprocessor.sv), only how much of each this ALU
+  // reads has changed. mot_idx values 80..127 are representable but never
+  // issued by software (no batch size beyond B=4 is speced); indexing
+  // stationary_q/stationary_n with one would read/write out of the
+  // synthesized array's bounds -- software's responsibility to never do
+  // that, same trust boundary as every other field here.
+  logic [6:0] mot_idx;
+  logic [4:0] mac_tiled_slot;
+  logic [4:0] read_acc_slot;
+  assign mot_idx        = funct7_i[6:0];
+  assign mac_tiled_slot = rd_i[4:0];
+  assign read_acc_slot  = funct7_i[4:0];
 
   // Shared 4-lane int8 dot product, used by both MAC4 (rs1 x rs2) and
   // MAC_TILED (stationary[mot] x rs1).

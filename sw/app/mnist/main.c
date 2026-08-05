@@ -67,6 +67,35 @@ static int mac4_v2_smoke_test(void) {
     return pass;
 }
 
+// Standalone correctness check for the widened MAC4 v3 addressing (map #2,
+// ticket "Coprocesseur MAC4 v3": stationary buffer 64->80 words, accumulator
+// array 8->32 slots), independent of the real inference path. Deliberately
+// exercises indices beyond the old ceilings -- mot=70 (only valid in the
+// widened 80-word buffer) and slot=20 (only valid in the widened 32-slot
+// accumulator array) -- to catch a decode width that silently stayed narrow
+// despite the wider funct7/rd fields already being available at the ALU's
+// ports (see core/mac4_copro/mac4_alu.sv).
+static int mac4_v3_smoke_test(void) {
+    const uint32_t word   = 0x0A090807u;  // lanes (uint8): 7, 8, 9, 10
+    const uint32_t weight = 0x05FCFB03u;  // lanes (int8): 3, -5, -4, 5
+    const int32_t expected = 7*3 + 8*(-5) + 9*(-4) + 10*5;  // 21-40-36+50 = -5
+
+    mac4_reset_acc();
+    mac4_load_stationary(word, 70);
+    mac4_tiled(weight, 70, 20);
+
+    const int32_t got = mac4_read_acc(20);
+    int pass = (got == expected);
+
+    mac4_reset_acc();
+    const int32_t got_after_reset = mac4_read_acc(20);
+    pass = pass && (got_after_reset == 0);
+
+    printf("MAC4 v3 smoke test: %s (mot=70 slot=20, expected %d, got %d, post-reset got %d)\n",
+           pass ? "PASS" : "FAIL", (int)expected, (int)got, (int)got_after_reset);
+    return pass;
+}
+
 void readStimulus(
                   UDATA_T* inputBuffer,
                   Target_T* expectedOutputBuffer)
@@ -124,6 +153,7 @@ int main(int argc, char* argv[]) {
 
     mac4_smoke_test();
     mac4_v2_smoke_test();
+    mac4_v3_smoke_test();
 
     readStimulus(inputBuffer, expectedOutputBuffer);
     instret = -read_csr(minstret);

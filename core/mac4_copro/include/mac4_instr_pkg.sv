@@ -43,24 +43,27 @@ package mac4_instr_pkg;
   // accumulation into a running sum is done in software with a plain `add`.
   //
   // LOAD_STATIONARY rs1  (funct3 = 001, funct7 = don't care)
-  //   stationary[funct7[5:0]] = rs1  -- writes one already-loaded input word
+  //   stationary[funct7[6:0]] = rs1  -- writes one already-loaded input word
   //   into the coprocessor's internal stationary buffer at word index
-  //   funct7[5:0] (0..63, buffer sized for the largest segment encountered,
-  //   ~38 words for fc2).
+  //   funct7[6:0]. Buffer is built to exactly 80 words (0..79 valid) -- 4
+  //   spatial positions x conv2's 20-word segment, the largest batch this
+  //   effort's weight-spatial-batching (B=4) needs; funct7[6:0] can encode
+  //   0..127 but software must never issue 80..127 (see mac4_alu.sv).
   //
   // MAC_TILED rs1  (funct3 = 010, funct7 = don't care)
-  //   acc[rd[2:0]] += sum_{i=0..3}( uint8(stationary[funct7[5:0]][8*i +: 8])
+  //   acc[rd[4:0]] += sum_{i=0..3}( uint8(stationary[funct7[6:0]][8*i +: 8])
   //                                 * int8(rs1[8*i +: 8]) )
-  //   rs1 = weight word (reloaded every call, never stationary). funct7[5:0]
-  //   selects the stationary word; rd[2:0] (rd has no real destination here,
-  //   writeback = 0) selects the target accumulator slot (0..7, T = 8).
+  //   rs1 = weight word (reloaded every call, never stationary). funct7[6:0]
+  //   selects the stationary word; rd[4:0] (rd has no real destination here,
+  //   writeback = 0) selects the target accumulator slot (0..31, T = 32 =
+  //   channel-tile(8) x spatial-batch(4)).
   //
   // READ_ACC rd  (funct3 = 011, funct7 = don't care)
-  //   rd = acc[funct7[2:0]]  -- returns the current value of accumulator slot
-  //   funct7[2:0] (0..7). rd here IS the real destination register.
+  //   rd = acc[funct7[4:0]]  -- returns the current value of accumulator slot
+  //   funct7[4:0] (0..31). rd here IS the real destination register.
   //
   // RESET_ACC  (funct3 = 100, funct7 = don't care)
-  //   acc[i] = 0 for all i in 0..7  -- global reset of all T accumulator
+  //   acc[i] = 0 for all i in 0..31  -- global reset of all T=32 accumulator
   //   slots, no per-slot reset (T is small enough that this is negligible).
   parameter int unsigned NbInstr = 5;
   parameter copro_issue_resp_t CoproInstr[NbInstr] = '{
