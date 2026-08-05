@@ -65,36 +65,62 @@ static UDATA_T sat(SUM_T weightedSum, int output,
     return saturate(weightedSum>>shift, NB_BITS);
 }
 
-// Accelerated conv1 path (ticket #28): same tile-outer / sy-middle /
-// output-channel-inner MAC4 v2 order as convcellPropagate2 below, but with
-// two conv1-specific corrections on top:
+// Accelerated conv1 path: weight-spatial-batching (map #2, ticket "conv1 :
+// tuilage spatial poids-stationnaire (B=4, avec reliquat)") on top of
+// ticket #28's tile-outer/sy-middle/output-channel-inner order and
+// alignment fix, plus its own complication neither conv2 nor #28 had to
+// deal with: CONV1_OUTPUTS_HEIGHT*WIDTH = 121 spatial positions, not
+// divisible by MAC4_SPATIAL_BATCH=4 (unlike conv2's clean
+// OUTPUTS_WIDTH==B). 121 = 30*4 + 1, so 30 full batches of 4 run through
+// convcellPropagate3's main loop below, then one explicit tail block
+// handles the 1 leftover position (flat index 120, i.e. (oy=10,ox=10)) with
+// the same instructions addressing just 1 position instead of 4 -- same
+// "reliquat" idiom already validated for fc1/fc2's channel-tile remainder
+// (ticket #27), just on the spatial axis instead of the channel axis, and
+// no separate scalar path needed here either.
 //
-// 1. Alignment: conv1 reads directly from the raw env image (ENV_MEM_STRIDE
-//    = 1, single channel), so a kernel row's 4 bytes (KERNEL_WIDTH *
-//    CONV1_NB_CHANNELS) start at `ix = ox * CONV1_STRIDE_X`, which is
-//    4-byte aligned only for even ox (ix % 4 == 0) -- odd ox lands on ix % 4
-//    == 2. conv1_input_shifted holds the same image shifted left by 2
-//    bytes, rebuilt once per propagate() call; reading it at (ix - 2)
-//    recovers the identical 4 bytes through an address that IS 4-byte
-//    aligned. So every (oy, ox) picks one of two already-aligned sources --
-//    never a genuinely misaligned lw, and 100% of kernel-row reads take the
-//    fast path (vs. ~50% before this ticket, when only even ox did).
-// 2. Codegen: that choice of source/base offset is made once per (oy, ox)
-//    below (input_base/ix_base), not re-tested per sy or per output the way
-//    the original per-call runtime alignment check was.
+// A batch's 4 positions are consecutive *flat* (oy*CONV1_OUTPUTS_WIDTH+ox)
+// indices, not necessarily from the same row (11 isn't a multiple of 4, so
+// batches routinely straddle row boundaries -- unlike conv2, this can't be
+// simplified to "one batch = one row"). Each position keeps ticket #28's
+// alignment logic entirely independent of its neighbors in the batch: even
+// ox reads `inputs` directly, odd ox reads `conv1_input_shifted` -- a batch
+// of 4 consecutive positions can (and often does) mix both, computed fresh
+// per position into small per-batch arrays before the tile/sy sweep. Since
+// conv1's segment is exactly 1 word, stationary mot = p (0..3, one word per
+// batch position, comfortably inside the 80-word buffer) and accumulator
+// slot = p*MAC4_NUM_ACC_SLOTS+channel-slot (0..31), the same addressing
+// scheme as conv2's mot/slot, just without conv2's extra segment-word (w)
+// dimension.
 //
 // CONV1_NB_OUTPUTS (16) is an exact multiple of T=8 (2 tiles, no partial
 // tile) and KERNEL_WIDTH * NB_CHANNELS is exactly 4 bytes (one MAC4 group,
-// no segment-word loop needed) -- both guarded by the #if checks below so a
-// future shape change fails to compile instead of silently corrupting
-// output.
+// no segment-word loop needed) -- both guarded by the #if checks below,
+// same as before this ticket, plus new guards for the batching factor and
+// the exact-1 remainder this file hardcodes.
 #if (CONV1_KERNEL_WIDTH * CONV1_NB_CHANNELS) != 4
-#error "conv1 kernel row is no longer exactly 4 bytes (one MAC4 group): convcellPropagate3's single mac4_load_stationary/mac4_tiled call no longer covers the whole row"
+#error "conv1 kernel row is no longer exactly 4 bytes (one MAC4 group): convcellPropagate3's single mac4_load_stationary/mac4_tiled call per position no longer covers the whole row"
 #endif
 #if (CONV1_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS) != 0
 #error "CONV1_NB_OUTPUTS is no longer an exact multiple of MAC4_NUM_ACC_SLOTS: convcellPropagate3's last tile would read/write out of bounds"
 #endif
+#if MAC4_NUM_ACC_SLOTS != 8
+#error "MAC4_NUM_ACC_SLOTS changed: update the hardcoded position accumulator offsets (0/8/16/24) in CONV1_MAC_TILE_SLOT to match"
+#endif
+#if MAC4_SPATIAL_BATCH != 4
+#error "MAC4_SPATIAL_BATCH changed: convcellPropagate3 hardcodes exactly 4 unrolled positions per full batch -- update the loop structure and CONV1_MAC_TILE_SLOT to match"
+#endif
+#if (MAC4_SPATIAL_BATCH * 1) > MAC4_STATIONARY_WORDS
+#error "conv1's batch (1 word/position) no longer fits the coprocessor's stationary buffer"
+#endif
+#if ((CONV1_OUTPUTS_HEIGHT * CONV1_OUTPUTS_WIDTH) % MAC4_SPATIAL_BATCH) != 1
+#error "conv1's spatial-position remainder is no longer exactly 1: convcellPropagate3's tail block hardcodes handling a single leftover position, not a variable count -- update it to match the new remainder"
+#endif
 
+// mac4_tiled()'s accumulator-slot argument needs a genuine preprocessor
+// literal (see the identical note in convcellPropagate2 above) -- ADD()'s
+// argument order matters here too: SLOT is always 0..7, so ADD(SLOT, N)
+// only ever needs ADD_0..ADD_7, already defined.
 #define CONV1_MAC_TILE_SLOT(SLOT, TILE_BASE)                                \
     {                                                                       \
         const int wOffset = wOffsetSyTerm + CONV1_NB_CHANNELS               \
@@ -102,6 +128,24 @@ static UDATA_T sat(SUM_T weightedSum, int output,
         uint32_t weight_word;                                              \
         memcpy(&weight_word, weights + wOffset, sizeof(weight_word));      \
         mac4_tiled(weight_word, 0, SLOT);                                  \
+        mac4_tiled(weight_word, 1, ADD(SLOT, 8));                          \
+        mac4_tiled(weight_word, 2, ADD(SLOT, 16));                         \
+        mac4_tiled(weight_word, 3, ADD(SLOT, 24));                         \
+    }
+
+// Tail-block-only: identical shape to CONV1_MAC_TILE_SLOT before this
+// ticket (a single position, mot=0, accumulator slot=SLOT directly) --
+// kept as its own macro rather than reusing CONV1_MAC_TILE_SLOT with some
+// "how many positions" parameter, since MAC_TILED's accumulator slot must
+// already be a preprocessor literal per position (no runtime-parametrized
+// count is possible here regardless).
+#define CONV1_MAC_TILE_SLOT_TAIL(SLOT, TILE_BASE)                          \
+    {                                                                      \
+        const int wOffset = wOffsetSyTerm + CONV1_NB_CHANNELS              \
+            * CONV1_KERNEL_WIDTH * CONV1_KERNEL_HEIGHT * ((TILE_BASE) + (SLOT)); \
+        uint32_t weight_word;                                             \
+        memcpy(&weight_word, weights + wOffset, sizeof(weight_word));     \
+        mac4_tiled(weight_word, 0, SLOT);                                 \
     }
 
 static void convcellPropagate3(
@@ -111,71 +155,146 @@ static void convcellPropagate3(
     const WDATA_T* __restrict weights,
     int rescaling)
 {
-    for (int oy = 0; oy < CONV1_OUTPUTS_HEIGHT; ++oy) {
-        const int iy = oy * CONV1_STRIDE_Y;
+    const int total_positions = CONV1_OUTPUTS_HEIGHT * CONV1_OUTPUTS_WIDTH; // 121
+    const int full_batches_end
+        = (total_positions / MAC4_SPATIAL_BATCH) * MAC4_SPATIAL_BATCH; // 120
 
-        for (int ox = 0; ox < CONV1_OUTPUTS_WIDTH; ++ox) {
+    for (int batch_start = 0; batch_start < full_batches_end;
+            batch_start += MAC4_SPATIAL_BATCH) {
+
+        // Per-position setup for this batch's 4 (possibly row-straddling)
+        // positions, done once per batch -- same "hoist the alignment
+        // test" principle ticket #28 established per-(oy,ox), now per
+        // position-in-batch. Each position's even/odd ox picks its own
+        // source independently of its batch-mates.
+        const UDATA_T* __restrict input_base[MAC4_SPATIAL_BATCH];
+        int ix_base[MAC4_SPATIAL_BATCH];
+        int iy[MAC4_SPATIAL_BATCH];
+        int oOffset[MAC4_SPATIAL_BATCH];
+
+        _Pragma("GCC unroll 4")
+        for (int p = 0; p < MAC4_SPATIAL_BATCH; ++p) {
+            const int flat = batch_start + p;
+            const int oy = flat / CONV1_OUTPUTS_WIDTH;
+            const int ox = flat % CONV1_OUTPUTS_WIDTH;
             const int ix = ox * CONV1_STRIDE_X;
+            iy[p] = oy * CONV1_STRIDE_Y;
 
-            int oOffset = CONV1_MEM_STRIDE * (ox + CONV1_OUTPUTS_WIDTH * oy);
-            if (oOffset >= CONV1_MEM_CONT_SIZE) {
-                oOffset += CONV1_MEM_WRAP_OFFSET - CONV1_MEM_CONT_OFFSET
-                            - CONV1_MEM_CONT_SIZE;
+            int off = CONV1_MEM_STRIDE * (ox + CONV1_OUTPUTS_WIDTH * oy);
+            if (off >= CONV1_MEM_CONT_SIZE) {
+                off += CONV1_MEM_WRAP_OFFSET - CONV1_MEM_CONT_OFFSET
+                        - CONV1_MEM_CONT_SIZE;
             }
+            oOffset[p] = off;
 
-            // Alignment test hoisted here: once per (oy, ox), not once per
-            // sy/output the way the original generic per-call path did it.
-            const UDATA_T* __restrict input_base;
-            int ix_base;
             if (ox & 1) {
-                input_base = conv1_input_shifted;
-                ix_base = ix - 2;
+                input_base[p] = conv1_input_shifted;
+                ix_base[p] = ix - 2;
             } else {
-                input_base = inputs;
-                ix_base = ix;
+                input_base[p] = inputs;
+                ix_base[p] = ix;
             }
+        }
 
-            for (int tile_base = 0; tile_base < CONV1_NB_OUTPUTS;
-                    tile_base += MAC4_NUM_ACC_SLOTS) {
-                mac4_reset_acc();
+        for (int tile_base = 0; tile_base < CONV1_NB_OUTPUTS;
+                tile_base += MAC4_NUM_ACC_SLOTS) {
+            mac4_reset_acc();
 
-                for (int sy = 0; sy < CONV1_KERNEL_HEIGHT; ++sy) {
-                    const int iOffset = ix_base
-                        + CONV1_CHANNELS_WIDTH * (iy + sy);
+            for (int sy = 0; sy < CONV1_KERNEL_HEIGHT; ++sy) {
+                _Pragma("GCC unroll 4")
+                for (int p = 0; p < MAC4_SPATIAL_BATCH; ++p) {
+                    const int iOffset = ix_base[p]
+                        + CONV1_CHANNELS_WIDTH * (iy[p] + sy);
 
                     uint32_t input_word;
-                    // __builtin_assume_aligned: this address is 4-byte
-                    // aligned at runtime for every (oy, ox) by construction
-                    // (input_base/ix_base above), but GCC can't prove it
-                    // statically through a runtime-branched base pointer
-                    // plus a runtime sy-offset -- without the hint it falls
-                    // back to a 9-instruction byte-packing sequence instead
-                    // of the single lw this produces (ticket #31 on map #29,
-                    // docs/research/conv1-codegen-fix.md: verified via
-                    // disassembly and RTL sim, conv1 80305 -> 64602 cycles).
+                    // See the identical __builtin_assume_aligned note
+                    // pre-#37: this address is 4-byte aligned at runtime
+                    // for every position by construction
+                    // (input_base[p]/ix_base[p] above), but GCC can't
+                    // prove it statically (ticket #31).
                     memcpy(&input_word,
-                           __builtin_assume_aligned(input_base + iOffset, 4),
+                           __builtin_assume_aligned(input_base[p] + iOffset, 4),
                            sizeof(input_word));
-                    mac4_load_stationary(input_word, 0);
-
-                    const int wOffsetSyTerm
-                        = CONV1_NB_CHANNELS * CONV1_KERNEL_WIDTH * sy;
-
-                    EVAL(REPEAT(MAC4_NUM_ACC_SLOTS, CONV1_MAC_TILE_SLOT, tile_base))
+                    mac4_load_stationary(input_word, p);
                 }
 
+                const int wOffsetSyTerm
+                    = CONV1_NB_CHANNELS * CONV1_KERNEL_WIDTH * sy;
+
+                EVAL(REPEAT(MAC4_NUM_ACC_SLOTS, CONV1_MAC_TILE_SLOT, tile_base))
+            }
+
+            _Pragma("GCC unroll 4")
+            for (int p = 0; p < MAC4_SPATIAL_BATCH; ++p) {
                 _Pragma("GCC unroll 8")
                 for (int slot = 0; slot < MAC4_NUM_ACC_SLOTS; ++slot) {
                     const int output = tile_base + slot;
-                    SUM_T weightedSum = biasses[output] + mac4_read_acc(slot);
-                    outputs[oOffset + output]
+                    SUM_T weightedSum = biasses[output]
+                        + mac4_read_acc(p * MAC4_NUM_ACC_SLOTS + slot);
+                    outputs[oOffset[p] + output]
                         = sat(weightedSum, output, CONV1_ACTIVATION, rescaling);
                 }
             }
         }
     }
+
+    // Tail batch: the single remaining spatial position (121 mod 4 = 1,
+    // flat index 120 = (oy=10, ox=10)) -- same instructions, addressing 1
+    // position instead of 4, no separate scalar path.
+    {
+        const int flat = full_batches_end;
+        const int oy = flat / CONV1_OUTPUTS_WIDTH;
+        const int ox = flat % CONV1_OUTPUTS_WIDTH;
+        const int ix = ox * CONV1_STRIDE_X;
+        const int iy = oy * CONV1_STRIDE_Y;
+
+        int oOffset = CONV1_MEM_STRIDE * (ox + CONV1_OUTPUTS_WIDTH * oy);
+        if (oOffset >= CONV1_MEM_CONT_SIZE) {
+            oOffset += CONV1_MEM_WRAP_OFFSET - CONV1_MEM_CONT_OFFSET
+                        - CONV1_MEM_CONT_SIZE;
+        }
+
+        const UDATA_T* __restrict input_base;
+        int ix_base;
+        if (ox & 1) {
+            input_base = conv1_input_shifted;
+            ix_base = ix - 2;
+        } else {
+            input_base = inputs;
+            ix_base = ix;
+        }
+
+        for (int tile_base = 0; tile_base < CONV1_NB_OUTPUTS;
+                tile_base += MAC4_NUM_ACC_SLOTS) {
+            mac4_reset_acc();
+
+            for (int sy = 0; sy < CONV1_KERNEL_HEIGHT; ++sy) {
+                const int iOffset = ix_base + CONV1_CHANNELS_WIDTH * (iy + sy);
+
+                uint32_t input_word;
+                memcpy(&input_word,
+                       __builtin_assume_aligned(input_base + iOffset, 4),
+                       sizeof(input_word));
+                mac4_load_stationary(input_word, 0);
+
+                const int wOffsetSyTerm
+                    = CONV1_NB_CHANNELS * CONV1_KERNEL_WIDTH * sy;
+
+                EVAL(REPEAT(MAC4_NUM_ACC_SLOTS, CONV1_MAC_TILE_SLOT_TAIL, tile_base))
+            }
+
+            _Pragma("GCC unroll 8")
+            for (int slot = 0; slot < MAC4_NUM_ACC_SLOTS; ++slot) {
+                const int output = tile_base + slot;
+                SUM_T weightedSum = biasses[output] + mac4_read_acc(slot);
+                outputs[oOffset + output]
+                    = sat(weightedSum, output, CONV1_ACTIVATION, rescaling);
+            }
+        }
+    }
 }
 
+#undef CONV1_MAC_TILE_SLOT_TAIL
 #undef CONV1_MAC_TILE_SLOT
 
 // Accelerated conv2 path: weight-spatial-batching (map #2, ticket "conv2 :
