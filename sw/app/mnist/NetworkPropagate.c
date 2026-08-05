@@ -178,16 +178,27 @@ static void convcellPropagate3(
 
 #undef CONV1_MAC_TILE_SLOT
 
-// Accelerated conv2 path: input-stationary reuse across a tile of T=8
-// output channels (see mac4.h / core/mac4_copro for LOAD_STATIONARY,
-// MAC_TILED, READ_ACC, RESET_ACC), replacing the original per-output
-// scalar-MAC loop with the tile-outer / sy-middle /
-// output-channel-inner order settled on by the mac4 v2 spec: for each tile
-// of T output channels, reset the hardware accumulators, then for each
-// kernel row (sy) load that row's input segment into the stationary buffer
-// once and MAC-tile it against all T channels' weights, then read back and
-// saturate each channel's accumulator only after the sy sweep completes --
-// no partial sum ever goes back to memory between sy's.
+// Accelerated conv2 path: weight-spatial-batching (map #2, ticket "conv2 :
+// tuilage spatial poids-stationnaire (B=4)") on top of MAC4 v2's
+// tile-outer/sy-middle/output-channel-inner order (see mac4.h /
+// core/mac4_copro for LOAD_STATIONARY, MAC_TILED, READ_ACC, RESET_ACC):
+// for each tile of T=8 output channels, reset the accumulators, then for
+// each kernel row (sy), load *all* MAC4_SPATIAL_BATCH=4 spatial positions'
+// input segments into disjoint sub-ranges of the stationary buffer, then
+// for each of the tile's 8 channels, load that channel's weight word once
+// and MAC-tile it against all 4 positions (4 fewer redundant weight `lw`s
+// per (tile, sy, channel, segment-word) than MAC4 v2's per-position
+// reload), then read back and saturate every position's every channel only
+// after the sy sweep completes -- no partial sum ever goes back to memory
+// between sy's, batches, or tiles.
+//
+// CONV2_OUTPUTS_WIDTH == MAC4_SPATIAL_BATCH == 4 (guarded below), so one
+// full output row *is* one spatial batch -- the existing `oy` loop already
+// sweeps batches, one per row, with no separate batch index needed. Each
+// position's segment/accumulator addressing is offset by its `ox` within
+// the row: stationary mot = ox*CONV2_SEGMENT_WORDS+w (0..79, exactly fills
+// the 80-word buffer across 4 positions x 20 words), accumulator slot =
+// ox*MAC4_NUM_ACC_SLOTS+channel-slot (0..31, exactly the widened T=32).
 //
 // This hardcodes CONV2_* rather than taking them as parameters:
 // mac4_load_stationary()/mac4_tiled() encode their "mot" word index as a
@@ -198,36 +209,62 @@ static void convcellPropagate3(
 // padding/partial window -- true for conv2, verified against
 // CONV2_PADDING_X/Y and CONV2_OUTPUTS_*_NOPAD), a segment length that's an
 // exact multiple of 4 bytes (KERNEL_WIDTH*NB_CHANNELS = 80 = 20 words, no
-// scalar remainder), and NB_OUTPUTS an exact multiple of T=8 (24 = 3 tiles,
-// no partial tile). conv1, fc1 and fc2 each got their own dedicated
-// treatment for the ways they don't meet this: conv1 (convcellPropagate3,
-// ticket #28) needs a shifted input copy for alignment and packs only a
-// single mac4 group per kernel row (no segment-word loop); fc1
-// (fccellPropagateUDATA_T, ticket #27) has an exact-multiple-of-4 segment
-// but NB_OUTPUTS=150 isn't a multiple of T=8, so its last tile runs with
-// fewer accumulator slots instead of a full 8; fc2 (fccellPropagateDATA_T,
-// ticket #27) has both that same partial-last-tile issue (NB_OUTPUTS=10)
-// and a segment (150 bytes) that isn't a multiple of 4, so its last 2
-// elements per output channel are still added in scalar C after
-// mac4_read_acc(), same values macsOnRange()'s old scalar tail used to
-// produce.
+// scalar remainder), NB_OUTPUTS an exact multiple of T=8 (24 = 3 tiles, no
+// partial tile), and OUTPUTS_WIDTH an exact multiple of B=4 (4, no partial
+// batch -- unlike conv1, which needs a ragged tail batch since its
+// OUTPUTS_WIDTH doesn't divide evenly by 4). conv1, fc1 and fc2 each got
+// their own dedicated treatment for the ways they don't meet this: conv1
+// (convcellPropagate3) needs a shifted input copy for alignment (ticket
+// #28) and, once batched, a ragged tail batch (ticket "conv1 : tuilage
+// spatial poids-stationnaire (B=4, avec reliquat)"); fc1/fc2
+// (fccellPropagateUDATA_T/DATA_T, ticket #27) have no spatial axis at all
+// to batch across -- permanently out of scope for weight-spatial-batching
+// (spec #34) -- and keep MAC4 v2's per-tile order unbatched, with fc1's
+// last tile running fewer accumulator slots and fc2's last 2 elements per
+// channel still added in scalar C, same as before this ticket.
 #define CONV2_SEGMENT_WORDS ((CONV2_KERNEL_WIDTH * CONV2_NB_CHANNELS) / 4)
 
-// The _Pragma("GCC unroll N") literals below must equal CONV2_SEGMENT_WORDS
-// and MAC4_NUM_ACC_SLOTS exactly, and CONV2_NB_OUTPUTS must divide evenly by
-// MAC4_NUM_ACC_SLOTS (no partial last tile -- convcellPropagate2 below has
-// no bounds check on the last tile's slot range, matching the fixed-T=8
-// hardware). None of this is re-derivable by the compiler across a
-// _Pragma's string argument, so catch drift here instead of silently
+// The _Pragma("GCC unroll N") literals below must equal CONV2_SEGMENT_WORDS,
+// MAC4_NUM_ACC_SLOTS and MAC4_SPATIAL_BATCH exactly; CONV2_NB_OUTPUTS must
+// divide evenly by MAC4_NUM_ACC_SLOTS (no partial last tile); the hardcoded
+// position offsets in CONV2_MAC_TILE_SLOT (0/8/16/24) assume
+// MAC4_NUM_ACC_SLOTS==8; and CONV2_OUTPUTS_WIDTH must equal
+// MAC4_SPATIAL_BATCH exactly, since convcellPropagate2 treats one output
+// row as one batch with no batch-index bookkeeping of its own. None of this
+// is re-derivable by the compiler across a _Pragma's string argument or a
+// hand-unrolled macro, so catch drift here instead of silently
 // under-unrolling (reintroducing the "impossible constraint in asm" class
-// of bug) or writing outputs[]/biasses[] out of bounds.
+// of bug) or writing outputs[]/biasses[]/the stationary buffer out of
+// bounds.
 #if CONV2_SEGMENT_WORDS != 20
 #error "CONV2_SEGMENT_WORDS changed: update the _Pragma(\"GCC unroll 20\") literals in convcellPropagate2 to match"
 #endif
 #if (CONV2_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS) != 0
 #error "CONV2_NB_OUTPUTS is no longer an exact multiple of MAC4_NUM_ACC_SLOTS: convcellPropagate2's last tile would read/write out of bounds"
 #endif
+#if MAC4_NUM_ACC_SLOTS != 8
+#error "MAC4_NUM_ACC_SLOTS changed: update the hardcoded position accumulator offsets (0/8/16/24) in CONV2_MAC_TILE_SLOT to match"
+#endif
+#if MAC4_SPATIAL_BATCH != 4
+#error "MAC4_SPATIAL_BATCH changed: convcellPropagate2 hardcodes exactly 4 unrolled positions per batch (one full CONV2_OUTPUTS_WIDTH row) -- update the loop structure and CONV2_MAC_TILE_SLOT to match"
+#endif
+#if CONV2_OUTPUTS_WIDTH != MAC4_SPATIAL_BATCH
+#error "CONV2_OUTPUTS_WIDTH no longer equals MAC4_SPATIAL_BATCH: convcellPropagate2 treats one full output row as exactly one spatial batch -- this no longer holds, the batching loop needs restructuring to span row boundaries"
+#endif
+#if (MAC4_SPATIAL_BATCH * CONV2_SEGMENT_WORDS) > MAC4_STATIONARY_WORDS
+#error "conv2's batch no longer fits the coprocessor's stationary buffer (MAC4_SPATIAL_BATCH * CONV2_SEGMENT_WORDS words needed vs MAC4_STATIONARY_WORDS available)"
+#endif
 
+// mac4_tiled()'s accumulator-slot argument is spliced into a literal
+// register name ("x" #slot in mac4.h, since MAC_TILED has no true
+// destination register) -- a genuine preprocessor-time stringizing, not a
+// GCC "i" asm-operand constraint like mac4_load_stationary()/mac4_read_acc()
+// use. `ox*MAC4_NUM_ACC_SLOTS+slot` as a runtime-computed C expression would
+// stringize to garbage text, not a register name, so each position's
+// accumulator offset (0/8/16/24) has to be added at the preprocessor level
+// instead, via utils.h's ADD() (SLOT is always 0..7 here, so ADD_0..ADD_7
+// suffice -- no extension of ADD() itself was needed, only the INC() chain
+// it's built on, already widened to 32 in ticket "Coprocesseur MAC4 v3").
 #define CONV2_MAC_TILE_SLOT(SLOT, TILE_BASE)                                 \
     {                                                                        \
         const int wOffset = wOffsetSyTerm + CONV2_NB_CHANNELS               \
@@ -237,7 +274,10 @@ static void convcellPropagate3(
             uint32_t weight_word;                                           \
             memcpy(&weight_word, weights + wOffset + 4 * w,                 \
                    sizeof(weight_word));                                    \
-            mac4_tiled(weight_word, w, SLOT);                               \
+            mac4_tiled(weight_word, 0 * CONV2_SEGMENT_WORDS + w, SLOT);      \
+            mac4_tiled(weight_word, 1 * CONV2_SEGMENT_WORDS + w, ADD(SLOT, 8)); \
+            mac4_tiled(weight_word, 2 * CONV2_SEGMENT_WORDS + w, ADD(SLOT, 16)); \
+            mac4_tiled(weight_word, 3 * CONV2_SEGMENT_WORDS + w, ADD(SLOT, 24)); \
         }                                                                   \
     }
 
@@ -251,15 +291,18 @@ static void convcellPropagate2(
     for (int oy = 0; oy < CONV2_OUTPUTS_HEIGHT; ++oy) {
         const int iy = oy * CONV2_STRIDE_Y;
 
-        for (int ox = 0; ox < CONV2_OUTPUTS_WIDTH; ++ox) {
-            const int ix = ox * CONV2_STRIDE_X;
-            const int oOffset = CONV2_MEM_STRIDE * (ox + CONV2_OUTPUTS_WIDTH * oy);
+        for (int tile_base = 0; tile_base < CONV2_NB_OUTPUTS;
+                tile_base += MAC4_NUM_ACC_SLOTS) {
+            mac4_reset_acc();
 
-            for (int tile_base = 0; tile_base < CONV2_NB_OUTPUTS;
-                    tile_base += MAC4_NUM_ACC_SLOTS) {
-                mac4_reset_acc();
-
-                for (int sy = 0; sy < CONV2_KERNEL_HEIGHT; ++sy) {
+            for (int sy = 0; sy < CONV2_KERNEL_HEIGHT; ++sy) {
+                // Load this row's 4 positions' input segments for this sy
+                // before touching any weight -- each position's 20 words
+                // land in its own disjoint sub-range of the stationary
+                // buffer (mot = ox*CONV2_SEGMENT_WORDS+w).
+                _Pragma("GCC unroll 4")
+                for (int ox = 0; ox < CONV2_OUTPUTS_WIDTH; ++ox) {
+                    const int ix = ox * CONV2_STRIDE_X;
                     int iOffset = CONV1_MEM_STRIDE
                         * (ix + CONV2_CHANNELS_WIDTH * (iy + sy));
 
@@ -273,19 +316,32 @@ static void convcellPropagate2(
                         uint32_t input_word;
                         memcpy(&input_word, inputs + iOffset + 4 * w,
                                sizeof(input_word));
-                        mac4_load_stationary(input_word, w);
+                        mac4_load_stationary(input_word,
+                                              ox * CONV2_SEGMENT_WORDS + w);
                     }
-
-                    const int wOffsetSyTerm
-                        = CONV2_NB_CHANNELS * CONV2_KERNEL_WIDTH * sy;
-
-                    EVAL(REPEAT(MAC4_NUM_ACC_SLOTS, CONV2_MAC_TILE_SLOT, tile_base))
                 }
 
+                const int wOffsetSyTerm
+                    = CONV2_NB_CHANNELS * CONV2_KERNEL_WIDTH * sy;
+
+                // Each weight word is loaded once here and reused across
+                // all 4 positions' MAC_TILED calls inside the macro -- the
+                // actual weight-spatial-batching win.
+                EVAL(REPEAT(MAC4_NUM_ACC_SLOTS, CONV2_MAC_TILE_SLOT, tile_base))
+            }
+
+            // Finalize (read back, bias, saturate, store) all 4 positions'
+            // 8 channels for this tile before the next tile_base's
+            // mac4_reset_acc() -- no partial sum ever leaves the
+            // coprocessor between batches or tiles.
+            _Pragma("GCC unroll 4")
+            for (int ox = 0; ox < CONV2_OUTPUTS_WIDTH; ++ox) {
+                const int oOffset = CONV2_MEM_STRIDE * (ox + CONV2_OUTPUTS_WIDTH * oy);
                 _Pragma("GCC unroll 8")
                 for (int slot = 0; slot < MAC4_NUM_ACC_SLOTS; ++slot) {
                     const int output = tile_base + slot;
-                    SUM_T weightedSum = biasses[output] + mac4_read_acc(slot);
+                    SUM_T weightedSum = biasses[output]
+                        + mac4_read_acc(ox * MAC4_NUM_ACC_SLOTS + slot);
                     outputs[oOffset + output]
                         = sat(weightedSum, output, CONV2_ACTIVATION, rescaling);
                 }
