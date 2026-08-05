@@ -144,7 +144,17 @@ static void convcellPropagate3(
                         + CONV1_CHANNELS_WIDTH * (iy + sy);
 
                     uint32_t input_word;
-                    memcpy(&input_word, input_base + iOffset,
+                    // __builtin_assume_aligned: this address is 4-byte
+                    // aligned at runtime for every (oy, ox) by construction
+                    // (input_base/ix_base above), but GCC can't prove it
+                    // statically through a runtime-branched base pointer
+                    // plus a runtime sy-offset -- without the hint it falls
+                    // back to a 9-instruction byte-packing sequence instead
+                    // of the single lw this produces (ticket #31 on map #29,
+                    // docs/research/conv1-codegen-fix.md: verified via
+                    // disassembly and RTL sim, conv1 80305 -> 64602 cycles).
+                    memcpy(&input_word,
+                           __builtin_assume_aligned(input_base + iOffset, 4),
                            sizeof(input_word));
                     mac4_load_stationary(input_word, 0);
 
