@@ -39,45 +39,6 @@ static int clamp(int v, int lo, int hi) {
     }
 }
 
-static void macsOnRange(const UDATA_T* __restrict inputs,
-                        const WDATA_T* __restrict weights,
-                        SUM_T* __restrict weightedSum,
-                        int nb_iterations)
-{
-    int iter = 0;
-
-    // 4-wide MAC4 fast path: only taken when both pointers are 4-byte
-    // aligned, checked per call -- no per-layer special-casing. Always
-    // aligned for conv2/fc1/fc2 (channel strides are multiples of 4).
-    // conv1's stride-2 window over a single-channel buffer makes iOffset
-    // alternate 0/2 mod 4 across output columns, so only every other call
-    // takes this path there; the rest fall through to the scalar loop
-    // below, safely (this check never passes on a genuinely misaligned
-    // pointer, so it never risks the hang a misaligned lw/sw causes on
-    // this core).
-    if ((((uintptr_t)inputs | (uintptr_t)weights) & 0x3u) == 0) {
-        int32_t acc = *weightedSum;
-        const int nb_groups = nb_iterations / 4;
-
-        for (int g = 0; g < nb_groups; ++g) {
-            uint32_t packed_inputs, packed_weights;
-            // memcpy rather than a (uint32_t*) cast: avoids the strict-
-            // aliasing UB of reading a uint8_t/int8_t array through a
-            // differently-typed pointer. Compiles down to a single lw.
-            memcpy(&packed_inputs, &inputs[iter], sizeof(packed_inputs));
-            memcpy(&packed_weights, &weights[iter], sizeof(packed_weights));
-            acc += mac4(packed_inputs, packed_weights);
-            iter += 4;
-        }
-
-        *weightedSum = acc;
-    }
-
-    for (; iter < nb_iterations; ++iter) {
-        *weightedSum += inputs[iter] * weights[iter];
-    }
-}
-
 static UDATA_T saturate(SUM_T value, uint32_t sat) {
     return clamp(value, (SUM_T)(0), ((SUM_T)(1) << sat) - 1);
 }
@@ -120,7 +81,7 @@ static UDATA_T sat(SUM_T weightedSum, int output,
 //    fast path (vs. ~50% before this ticket, when only even ox did).
 // 2. Codegen: that choice of source/base offset is made once per (oy, ox)
 //    below (input_base/ix_base), not re-tested per sy or per output the way
-//    macsOnRange()'s runtime alignment check was.
+//    the original per-call runtime alignment check was.
 //
 // CONV1_NB_OUTPUTS (16) is an exact multiple of T=8 (2 tiles, no partial
 // tile) and KERNEL_WIDTH * NB_CHANNELS is exactly 4 bytes (one MAC4 group,
@@ -163,7 +124,7 @@ static void convcellPropagate3(
             }
 
             // Alignment test hoisted here: once per (oy, ox), not once per
-            // sy/output the way the generic macsOnRange() path did it.
+            // sy/output the way the original generic per-call path did it.
             const UDATA_T* __restrict input_base;
             int ix_base;
             if (ox & 1) {
@@ -209,8 +170,8 @@ static void convcellPropagate3(
 
 // Accelerated conv2 path: input-stationary reuse across a tile of T=8
 // output channels (see mac4.h / core/mac4_copro for LOAD_STATIONARY,
-// MAC_TILED, READ_ACC, RESET_ACC), replacing the generic per-output
-// macsOnRange() loop with the tile-outer / sy-middle /
+// MAC_TILED, READ_ACC, RESET_ACC), replacing the original per-output
+// scalar-MAC loop with the tile-outer / sy-middle /
 // output-channel-inner order settled on by the mac4 v2 spec: for each tile
 // of T output channels, reset the hardware accumulators, then for each
 // kernel row (sy) load that row's input segment into the stationary buffer
@@ -218,22 +179,28 @@ static void convcellPropagate3(
 // saturate each channel's accumulator only after the sy sweep completes --
 // no partial sum ever goes back to memory between sy's.
 //
-// This hardcodes CONV2_* rather than taking them as parameters (unlike the
-// generic macsOnRange() callers below): mac4_load_stationary()/mac4_tiled()
-// encode their "mot" word index as a compile-time immediate, so the
-// segment-word loop must be a genuine integer constant expression, not
-// something that merely happens to fold to a constant after inlining. Valid
-// only where conv2's actual shape holds: contiguous input segment
-// (NB_CHANNELS == INPUT_MEM_STRIDE, no padding/partial window -- true for
-// conv2, verified against CONV2_PADDING_X/Y and CONV2_OUTPUTS_*_NOPAD), a
-// segment length that's an exact multiple of 4 bytes
-// (KERNEL_WIDTH*NB_CHANNELS = 80 = 20 words, no scalar remainder), and
-// NB_OUTPUTS an exact multiple of T=8 (24 = 3 tiles, no partial tile). conv1
-// got its own dedicated treatment above (convcellPropagate3, ticket #28: a
-// single mac4 group per kernel row plus a shifted input copy for alignment,
-// rather than a segment-word loop). fc1/fc2 don't meet the exact-multiple-
-// of-T requirement (150 % 8 == 6, 10 % 8 == 2) and keep using macsOnRange as
-// before.
+// This hardcodes CONV2_* rather than taking them as parameters:
+// mac4_load_stationary()/mac4_tiled() encode their "mot" word index as a
+// compile-time immediate, so the segment-word loop must be a genuine
+// integer constant expression, not something that merely happens to fold to
+// a constant after inlining. Valid only where conv2's actual shape holds:
+// contiguous input segment (NB_CHANNELS == INPUT_MEM_STRIDE, no
+// padding/partial window -- true for conv2, verified against
+// CONV2_PADDING_X/Y and CONV2_OUTPUTS_*_NOPAD), a segment length that's an
+// exact multiple of 4 bytes (KERNEL_WIDTH*NB_CHANNELS = 80 = 20 words, no
+// scalar remainder), and NB_OUTPUTS an exact multiple of T=8 (24 = 3 tiles,
+// no partial tile). conv1, fc1 and fc2 each got their own dedicated
+// treatment for the ways they don't meet this: conv1 (convcellPropagate3,
+// ticket #28) needs a shifted input copy for alignment and packs only a
+// single mac4 group per kernel row (no segment-word loop); fc1
+// (fccellPropagateUDATA_T, ticket #27) has an exact-multiple-of-4 segment
+// but NB_OUTPUTS=150 isn't a multiple of T=8, so its last tile runs with
+// fewer accumulator slots instead of a full 8; fc2 (fccellPropagateDATA_T,
+// ticket #27) has both that same partial-last-tile issue (NB_OUTPUTS=10)
+// and a segment (150 bytes) that isn't a multiple of 4, so its last 2
+// elements per output channel are still added in scalar C after
+// mac4_read_acc(), same values macsOnRange()'s old scalar tail used to
+// produce.
 #define CONV2_SEGMENT_WORDS ((CONV2_KERNEL_WIDTH * CONV2_NB_CHANNELS) / 4)
 
 // The _Pragma("GCC unroll N") literals below must equal CONV2_SEGMENT_WORDS
@@ -320,173 +287,208 @@ static void convcellPropagate2(
 #undef CONV2_MAC_TILE_SLOT
 #undef CONV2_SEGMENT_WORDS
 
+// Accelerated fc1 path (ticket #27): same tile-outer / sy-middle /
+// output-channel-inner MAC4 v2 order as convcellPropagate2/3, applied to a
+// fully-connected layer (no spatial oy/ox loop -- OUTPUTS_HEIGHT/WIDTH are
+// both 1 -- so "sy" is fc1's own iy loop over CHANNELS_HEIGHT). Each iy
+// segment is NB_CHANNELS * CHANNELS_WIDTH = 96 bytes = 24 words exactly (no
+// scalar element remainder, unlike fc2 below).
+//
+// FC1_NB_OUTPUTS (150) is NOT an exact multiple of T=8 (150 = 18*8 + 6), so
+// unlike conv1/conv2 this needs a genuine remainder tile: 18 full tiles run
+// through a runtime tile_base loop (REPEAT(8, ...), exactly like conv2),
+// then one more explicit tail tile covers the last 6 output channels with
+// REPEAT(6, ...) -- same instructions, just fewer accumulator slots
+// addressed, no separate scalar queue needed for this kind (see spec #24,
+// "Reliquat de canaux de sortie").
+#if (FC1_NB_CHANNELS * FC1_CHANNELS_WIDTH) % 4 != 0
+#error "fc1 segment length is no longer a multiple of 4: fccellPropagateUDATA_T's word-packed load/mac would leave a scalar remainder, like fc2's"
+#endif
+#define FC1_SEGMENT_WORDS ((FC1_NB_CHANNELS * FC1_CHANNELS_WIDTH) / 4)
+#if FC1_SEGMENT_WORDS != 24
+#error "FC1_SEGMENT_WORDS changed: update the _Pragma(\"GCC unroll 24\") literals in fccellPropagateUDATA_T to match"
+#endif
+#define FC1_FULL_TILES (FC1_NB_OUTPUTS / MAC4_NUM_ACC_SLOTS)
+// A literal, not `(FC1_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS)`: REPEAT()/DEC() token-
+// paste this against a digit suffix (DEC_6, ...), which only works for a
+// literal decimal token, not an unevaluated preprocessor expression.
+#define FC1_TAIL_SLOTS 6
+#if FC1_TAIL_SLOTS != (FC1_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS)
+#error "FC1_TAIL_SLOTS changed: update the literal here (and the _Pragma(\"GCC unroll 6\") literal in fccellPropagateUDATA_T) to match FC1_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS"
+#endif
+
+#define FC1_MAC_TILE_SLOT(SLOT, TILE_BASE)                                  \
+    {                                                                       \
+        const int wOffset = wOffsetIyTerm + FC1_NB_CHANNELS               \
+            * FC1_CHANNELS_WIDTH * FC1_CHANNELS_HEIGHT * ((TILE_BASE) + (SLOT)); \
+        _Pragma("GCC unroll 24")                                           \
+        for (int w = 0; w < FC1_SEGMENT_WORDS; ++w) {                      \
+            uint32_t weight_word;                                          \
+            memcpy(&weight_word, weights + wOffset + 4 * w,                \
+                   sizeof(weight_word));                                   \
+            mac4_tiled(weight_word, w, SLOT);                              \
+        }                                                                  \
+    }
+
+// Shared between the full-tile loop and the tail tile below: loads this
+// tile's 4 iy segments into the stationary buffer and MAC-tiles them
+// against SLOT_COUNT output channels' weights. `tile_base` and `inputs`/
+// `weights` come from the enclosing scope (a local `tile_base` is in scope
+// at both call sites).
+#define FC1_TILE_BODY(SLOT_COUNT)                                           \
+    for (int iy = 0; iy < FC1_CHANNELS_HEIGHT; ++iy) {                      \
+        const int iOffset = FC1_NB_CHANNELS * FC1_CHANNELS_WIDTH * iy;      \
+        _Pragma("GCC unroll 24")                                           \
+        for (int w = 0; w < FC1_SEGMENT_WORDS; ++w) {                      \
+            uint32_t input_word;                                           \
+            memcpy(&input_word, inputs + iOffset + 4 * w,                  \
+                   sizeof(input_word));                                    \
+            mac4_load_stationary(input_word, w);                          \
+        }                                                                   \
+        const int wOffsetIyTerm = FC1_NB_CHANNELS * FC1_CHANNELS_WIDTH * iy; \
+        EVAL(REPEAT(SLOT_COUNT, FC1_MAC_TILE_SLOT, tile_base))             \
+    }
+
 static void fccellPropagateUDATA_T(
     const UDATA_T* __restrict inputs,
     UDATA_T* __restrict outputs,
     const BDATA_T* __restrict biasses,
     const WDATA_T* __restrict weights,
-    const int rescaling,
-    int NB_CHANNELS, 
-    int CHANNELS_HEIGHT, int CHANNELS_WIDTH,
-    int NB_OUTPUTS,
-    int OUTPUTS_HEIGHT, int OUTPUTS_WIDTH,
-    ActivationFunction_T ACTIVATION,
-    // Memory mapping: inputs
-    int INPUT_MEM_CONT_OFFSET,
-    int INPUT_MEM_CONT_SIZE,
-    int INPUT_MEM_WRAP_OFFSET,
-    int INPUT_MEM_WRAP_SIZE,
-    int INPUT_MEM_STRIDE,
-    // Memory mapping: outputs
-    int OUTPUT_MEM_CONT_OFFSET,
-    int OUTPUT_MEM_CONT_SIZE,
-    int OUTPUT_MEM_WRAP_OFFSET,
-    int OUTPUT_MEM_WRAP_SIZE,
-    int OUTPUT_MEM_STRIDE)
+    const int rescaling)
 {
-    // static_assert(OUTPUTS_HEIGHT == 1, "Outputs height should be 1");
-    // static_assert(OUTPUTS_WIDTH == 1, "Outputs width should be 1");
-    // static_assert(OUTPUT_MEM_WRAP_SIZE == 0, "Output wrapping not supported");
+    for (int tile_base = 0; tile_base < FC1_FULL_TILES * MAC4_NUM_ACC_SLOTS;
+            tile_base += MAC4_NUM_ACC_SLOTS) {
+        mac4_reset_acc();
 
-    for (int och = 0; och < NB_OUTPUTS; och++) {
-        SUM_T weightedSum = biasses[och];
+        FC1_TILE_BODY(MAC4_NUM_ACC_SLOTS)
 
-        for (int iy = 0; iy < CHANNELS_HEIGHT; ++iy) {
-            const int iPos = (CHANNELS_WIDTH * iy);
-            int iOffset = INPUT_MEM_STRIDE * iPos;
-
-            // Wrapping cannot occur in the middle of a line, except if
-            // there is only one line (1D)!
-            bool wrapInRange = false;
-
-            if (INPUT_MEM_WRAP_SIZE > 0 && iOffset >= INPUT_MEM_CONT_SIZE) {
-                iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
-                            - INPUT_MEM_CONT_SIZE;
-            }
-            else if (INPUT_MEM_WRAP_SIZE > 0 && CHANNELS_WIDTH > 1
-                && CHANNELS_HEIGHT == 1 // single line (1D)!
-                && iOffset + CHANNELS_WIDTH * NB_CHANNELS
-                    > INPUT_MEM_CONT_SIZE)
-            {
-                wrapInRange = true;
-            }
-
-            const int wOffset = NB_CHANNELS * CHANNELS_WIDTH
-                                    * (iy + CHANNELS_HEIGHT * och);
-
-            if (!wrapInRange && INPUT_MEM_STRIDE == NB_CHANNELS) {
-                macsOnRange(
-                    inputs + iOffset, 
-                    weights + wOffset, 
-                    &weightedSum, NB_CHANNELS * CHANNELS_WIDTH);
-            }
-            else {
-                for (int ix = 0; ix < CHANNELS_WIDTH; ++ix) {
-                    int iOffsetInRange = iOffset + ix * INPUT_MEM_STRIDE;
-
-                    if (wrapInRange
-                        && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
-                    {
-                        iOffsetInRange += INPUT_MEM_WRAP_OFFSET
-                                    - INPUT_MEM_CONT_OFFSET
-                                    - INPUT_MEM_CONT_SIZE;
-                    }
-
-                    macsOnRange(
-                        inputs + iOffsetInRange, 
-                        weights + wOffset + ix * NB_CHANNELS, 
-                        &weightedSum, NB_CHANNELS);
-                }
-            }
+        _Pragma("GCC unroll 8")
+        for (int slot = 0; slot < MAC4_NUM_ACC_SLOTS; ++slot) {
+            const int output = tile_base + slot;
+            SUM_T weightedSum = biasses[output] + mac4_read_acc(slot);
+            outputs[output] = sat(weightedSum, output, FC1_ACTIVATION, rescaling);
         }
+    }
 
-        outputs[och] = sat(weightedSum, och, ACTIVATION, rescaling);
+    {
+        const int tile_base = FC1_FULL_TILES * MAC4_NUM_ACC_SLOTS;
+        mac4_reset_acc();
+
+        FC1_TILE_BODY(FC1_TAIL_SLOTS)
+
+        _Pragma("GCC unroll 6")
+        for (int slot = 0; slot < FC1_TAIL_SLOTS; ++slot) {
+            const int output = tile_base + slot;
+            SUM_T weightedSum = biasses[output] + mac4_read_acc(slot);
+            outputs[output] = sat(weightedSum, output, FC1_ACTIVATION, rescaling);
+        }
     }
 }
+
+#undef FC1_TILE_BODY
+#undef FC1_MAC_TILE_SLOT
+
+// Accelerated fc2 path (ticket #27): same tile-outer/output-inner order as
+// fc1 above, but fc2 has a single segment per output channel (CHANNELS_
+// HEIGHT == CHANNELS_WIDTH == 1, no iy loop needed) of NB_CHANNELS = 150
+// bytes -- NOT a multiple of 4 (150 = 37*4 + 2). The 37 full words go
+// through the same word-packed load/mac path as conv2/fc1; the last 2
+// elements can't form a word, so they keep the exact scalar C fallback
+// macsOnRange() used to fall through to (FC2_SCALAR_REMAINDER below), added
+// onto the hardware accumulator after mac4_read_acc() -- this is the
+// "reliquat scalaire" the ticket calls out as staying unchanged.
+#if FC2_CHANNELS_HEIGHT != 1 || FC2_CHANNELS_WIDTH != 1
+#error "fc2 shape changed: fccellPropagateDATA_T hardcodes a single NB_CHANNELS-long segment (CHANNELS_HEIGHT == CHANNELS_WIDTH == 1)"
+#endif
+#define FC2_SEGMENT_WORDS (FC2_NB_CHANNELS / 4)
+#define FC2_SEGMENT_REMAINDER (FC2_NB_CHANNELS % 4)
+#if FC2_SEGMENT_WORDS != 37
+#error "FC2_SEGMENT_WORDS changed: update the _Pragma(\"GCC unroll 37\") literals in fccellPropagateDATA_T to match"
+#endif
+#if FC2_SEGMENT_REMAINDER != 2
+#error "fc2 segment remainder is no longer 2 elements: update FC2_SCALAR_REMAINDER in fccellPropagateDATA_T to match FC2_NB_CHANNELS % 4"
+#endif
+#define FC2_FULL_TILES (FC2_NB_OUTPUTS / MAC4_NUM_ACC_SLOTS)
+// A literal, not `(FC2_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS)` -- see FC1_TAIL_SLOTS
+// above for why REPEAT()/DEC() need a literal decimal token here.
+#define FC2_TAIL_SLOTS 2
+#if FC2_TAIL_SLOTS != (FC2_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS)
+#error "FC2_TAIL_SLOTS changed: update the literal here (and the _Pragma(\"GCC unroll 2\") literal in fccellPropagateDATA_T) to match FC2_NB_OUTPUTS % MAC4_NUM_ACC_SLOTS"
+#endif
+
+#define FC2_SCALAR_REMAINDER(WOFFSET)                                       \
+    (inputs[FC2_SEGMENT_WORDS * 4]                                         \
+        * weights[(WOFFSET) + FC2_SEGMENT_WORDS * 4]                       \
+     + inputs[FC2_SEGMENT_WORDS * 4 + 1]                                   \
+        * weights[(WOFFSET) + FC2_SEGMENT_WORDS * 4 + 1])
+
+#define FC2_MAC_TILE_SLOT(SLOT, TILE_BASE)                                  \
+    {                                                                       \
+        const int wOffset = FC2_NB_CHANNELS * ((TILE_BASE) + (SLOT));      \
+        _Pragma("GCC unroll 37")                                           \
+        for (int w = 0; w < FC2_SEGMENT_WORDS; ++w) {                      \
+            uint32_t weight_word;                                          \
+            memcpy(&weight_word, weights + wOffset + 4 * w,                \
+                   sizeof(weight_word));                                   \
+            mac4_tiled(weight_word, w, SLOT);                              \
+        }                                                                   \
+    }
+
+// Loads the single 150-element segment into the stationary buffer and
+// MAC-tiles it against SLOT_COUNT output channels' weights. `tile_base`
+// comes from the enclosing scope, as in FC1_TILE_BODY above.
+#define FC2_TILE_BODY(SLOT_COUNT)                                           \
+    _Pragma("GCC unroll 37")                                               \
+    for (int w = 0; w < FC2_SEGMENT_WORDS; ++w) {                          \
+        uint32_t input_word;                                               \
+        memcpy(&input_word, inputs + 4 * w, sizeof(input_word));           \
+        mac4_load_stationary(input_word, w);                              \
+    }                                                                       \
+    EVAL(REPEAT(SLOT_COUNT, FC2_MAC_TILE_SLOT, tile_base))
 
 static void fccellPropagateDATA_T(
     const UDATA_T* __restrict inputs,
     DATA_T* __restrict outputs,
     const BDATA_T* __restrict biasses,
     const WDATA_T* __restrict weights,
-    const int rescaling,
-    int NB_CHANNELS, 
-    int CHANNELS_HEIGHT, int CHANNELS_WIDTH,
-    int NB_OUTPUTS,
-    int OUTPUTS_HEIGHT, int OUTPUTS_WIDTH,
-    ActivationFunction_T ACTIVATION,
-    // Memory mapping: inputs
-    int INPUT_MEM_CONT_OFFSET,
-    int INPUT_MEM_CONT_SIZE,
-    int INPUT_MEM_WRAP_OFFSET,
-    int INPUT_MEM_WRAP_SIZE,
-    int INPUT_MEM_STRIDE,
-    // Memory mapping: outputs
-    int OUTPUT_MEM_CONT_OFFSET,
-    int OUTPUT_MEM_CONT_SIZE,
-    int OUTPUT_MEM_WRAP_OFFSET,
-    int OUTPUT_MEM_WRAP_SIZE,
-    int OUTPUT_MEM_STRIDE)
+    const int rescaling)
 {
-    // static_assert(OUTPUTS_HEIGHT == 1, "Outputs height should be 1");
-    // static_assert(OUTPUTS_WIDTH == 1, "Outputs width should be 1");
-    // static_assert(OUTPUT_MEM_WRAP_SIZE == 0, "Output wrapping not supported");
+    for (int tile_base = 0; tile_base < FC2_FULL_TILES * MAC4_NUM_ACC_SLOTS;
+            tile_base += MAC4_NUM_ACC_SLOTS) {
+        mac4_reset_acc();
 
-    for (int och = 0; och < NB_OUTPUTS; och++) {
-        SUM_T weightedSum = biasses[och];
+        FC2_TILE_BODY(MAC4_NUM_ACC_SLOTS)
 
-        for (int iy = 0; iy < CHANNELS_HEIGHT; ++iy) {
-            const int iPos = (CHANNELS_WIDTH * iy);
-            int iOffset = INPUT_MEM_STRIDE * iPos;
-
-            // Wrapping cannot occur in the middle of a line, except if
-            // there is only one line (1D)!
-            bool wrapInRange = false;
-
-            if (INPUT_MEM_WRAP_SIZE > 0 && iOffset >= INPUT_MEM_CONT_SIZE) {
-                iOffset += INPUT_MEM_WRAP_OFFSET - INPUT_MEM_CONT_OFFSET
-                            - INPUT_MEM_CONT_SIZE;
-            }
-            else if (INPUT_MEM_WRAP_SIZE > 0 && CHANNELS_WIDTH > 1
-                && CHANNELS_HEIGHT == 1 // single line (1D)!
-                && iOffset + CHANNELS_WIDTH * NB_CHANNELS
-                    > INPUT_MEM_CONT_SIZE)
-            {
-                wrapInRange = true;
-            }
-
-            const int wOffset = NB_CHANNELS * CHANNELS_WIDTH
-                                    * (iy + CHANNELS_HEIGHT * och);
-
-            if (!wrapInRange && INPUT_MEM_STRIDE == NB_CHANNELS) {
-                macsOnRange(
-                    inputs + iOffset, 
-                    weights + wOffset, 
-                    &weightedSum, NB_CHANNELS * CHANNELS_WIDTH);
-            }
-            else {
-                for (int ix = 0; ix < CHANNELS_WIDTH; ++ix) {
-                    int iOffsetInRange = iOffset + ix * INPUT_MEM_STRIDE;
-
-                    if (wrapInRange
-                        && iOffsetInRange >= INPUT_MEM_CONT_SIZE)
-                    {
-                        iOffsetInRange += INPUT_MEM_WRAP_OFFSET
-                                    - INPUT_MEM_CONT_OFFSET
-                                    - INPUT_MEM_CONT_SIZE;
-                    }
-
-                    macsOnRange(
-                        inputs + iOffsetInRange, 
-                        weights + wOffset + ix * NB_CHANNELS, 
-                        &weightedSum, NB_CHANNELS);
-                }
-            }
+        _Pragma("GCC unroll 8")
+        for (int slot = 0; slot < MAC4_NUM_ACC_SLOTS; ++slot) {
+            const int output = tile_base + slot;
+            const int wOffset = FC2_NB_CHANNELS * output;
+            SUM_T weightedSum = biasses[output] + mac4_read_acc(slot)
+                + FC2_SCALAR_REMAINDER(wOffset);
+            outputs[output] = sat(weightedSum, output, FC2_ACTIVATION, rescaling);
         }
+    }
 
-        outputs[och] = sat(weightedSum, och, ACTIVATION, rescaling);
+    {
+        const int tile_base = FC2_FULL_TILES * MAC4_NUM_ACC_SLOTS;
+        mac4_reset_acc();
+
+        FC2_TILE_BODY(FC2_TAIL_SLOTS)
+
+        _Pragma("GCC unroll 2")
+        for (int slot = 0; slot < FC2_TAIL_SLOTS; ++slot) {
+            const int output = tile_base + slot;
+            const int wOffset = FC2_NB_CHANNELS * output;
+            SUM_T weightedSum = biasses[output] + mac4_read_acc(slot)
+                + FC2_SCALAR_REMAINDER(wOffset);
+            outputs[output] = sat(weightedSum, output, FC2_ACTIVATION, rescaling);
+        }
     }
 }
+
+#undef FC2_TILE_BODY
+#undef FC2_MAC_TILE_SLOT
+#undef FC2_SCALAR_REMAINDER
 
 static void maxPropagate1(
     const DATA_T* __restrict inputs,
@@ -584,14 +586,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
 
     const unsigned long start_fc1 = read_csr(mcycle);
 
-    fccellPropagateUDATA_T(conv2_output , fc1_output, fc1_biases, fc1_weights, 8,
-    FC1_NB_CHANNELS, FC1_CHANNELS_HEIGHT, 
-    FC1_CHANNELS_WIDTH, FC1_NB_OUTPUTS, 
-    FC1_OUTPUTS_HEIGHT, FC1_OUTPUTS_WIDTH, FC1_ACTIVATION, 
-    CONV2_MEM_CONT_OFFSET, CONV2_MEM_CONT_SIZE, 
-    CONV2_MEM_WRAP_OFFSET, CONV2_MEM_WRAP_SIZE, 
-    CONV2_MEM_STRIDE, FC1_MEM_CONT_OFFSET, 
-    FC1_MEM_CONT_SIZE, FC1_MEM_WRAP_OFFSET, FC1_MEM_WRAP_SIZE, FC1_MEM_STRIDE);
+    fccellPropagateUDATA_T(conv2_output, fc1_output, fc1_biases, fc1_weights, 8);
 
     printf("fc1: %lu cycles\n", read_csr(mcycle) - start_fc1);
 
@@ -609,15 +604,7 @@ void propagate(const UDATA_T* inputs, Target_T* outputs, UDATA_T* maxPropagate_v
 
     const unsigned long start_fc2 = read_csr(mcycle);
 
-    fccellPropagateDATA_T(fc1_output , fc2_output, fc2_biases, fc2_weights, 11,
-    FC2_NB_CHANNELS, FC2_CHANNELS_HEIGHT, 
-    FC2_CHANNELS_WIDTH, FC2_NB_OUTPUTS, 
-    FC2_OUTPUTS_HEIGHT, FC2_OUTPUTS_WIDTH, 
-    FC2_ACTIVATION, FC1_MEM_CONT_OFFSET, 
-    FC1_MEM_CONT_SIZE, FC1_MEM_WRAP_OFFSET, 
-    FC1_MEM_WRAP_SIZE, FC1_MEM_STRIDE, 
-    FC2_MEM_CONT_OFFSET, FC2_MEM_CONT_SIZE, 
-    FC2_MEM_WRAP_OFFSET, FC2_MEM_WRAP_SIZE, FC2_MEM_STRIDE);
+    fccellPropagateDATA_T(fc1_output, fc2_output, fc2_biases, fc2_weights, 11);
 
     printf("fc2: %lu cycles\n", read_csr(mcycle) - start_fc2);
 
